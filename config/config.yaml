@@ -14,6 +14,7 @@ redis:
   password: ""
   db: 0
 
+
 milvus:
   uri: "http://localhost:19530"
 

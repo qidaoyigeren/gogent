@@ -2,16 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"gogent/internal/auth"
 	"gogent/internal/config"
-	"gogent/internal/handler"
 	"gogent/pkg/idgen"
 	"log/slog"
-	"net/http"
 	"os"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
@@ -19,7 +16,7 @@ import (
 )
 
 func main() {
-	// ========== Day 1: 配置加载 ==========
+	// 1. 加载配置
 	cfgPath := "config/config.yaml"
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		cfgPath = p
@@ -30,15 +27,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ========== Day 3: ID 生成器 ==========
+	// 2. 初始化 JWT
+	auth.InitJWT("")
+
+	// 3. 初始化 Snowflake ID 生成器
 	if err := idgen.Init(0, 0); err != nil {
 		slog.Error("failed to initialize id generator", "err", err)
 		os.Exit(1)
 	}
 
-	// ========== Day 3: 基础设施初始化 ==========
-
-	// Redis
+	// 4. 连接 Redis
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
@@ -48,16 +46,18 @@ func main() {
 		slog.Warn("redis not available", "err", err)
 	}
 
-	// PostgreSQL 连接池
+	// 解析 pgxpool 配置
 	poolConfig, err := pgxpool.ParseConfig(cfg.Database.DSN)
 	if err != nil {
 		slog.Error("failed to parse pool config", "err", err)
 		os.Exit(1)
 	}
 
+	// 配置连接池参数
 	poolConfig.MaxConns = int32(cfg.Database.MaxOpenConns)
 	poolConfig.MinConns = int32(cfg.Database.MaxIdleConns)
 
+	// 解析连接最大存活时间
 	if duration, err := time.ParseDuration(cfg.Database.ConnMaxLifetime); err == nil {
 		poolConfig.MaxConnLifetime = duration
 	} else {
@@ -76,31 +76,9 @@ func main() {
 			"minConns", poolConfig.MinConns)
 	}
 
-	// GORM（Day 3 初始化，后续 Days 使用）
+	// 使用 GORM 初始化数据库
 	_, err = gorm.Open(postgres.Open(cfg.Database.DSN), &gorm.Config{})
 	if err != nil {
 		slog.Warn("database not available, some features disabled", "err", err)
 	}
-
-	// ========== Day 2: 路由与中间件 ==========
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(handler.RecoveryMiddleware())
-	r.Use(handler.CORSMiddleware())
-	r.Use(handler.RequestLogMiddleware())
-
-	// 健康检查
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
-	// ========== 启动服务 ==========
-	addr := fmt.Sprintf(":%d", cfg.Server.Port)
-	slog.Info("server starting", "addr", addr)
-
-	if err := r.Run(addr); err != nil {
-		slog.Error("server failed", "err", err)
-		os.Exit(1)
-	}
-
 }
