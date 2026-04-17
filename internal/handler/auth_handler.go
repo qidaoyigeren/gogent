@@ -54,18 +54,22 @@ func (h *AuthHandler) login(c *gin.Context) {
 		response.FailWithCode(c, errcode.ClientError, "用户名或密码错误")
 		return
 	}
+
+	// Check password: support both BCrypt (Go) and plaintext (Java legacy)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		// Fallback: check plaintext password (for Java legacy users)
 		if user.Password != req.Password {
 			response.FailWithCode(c, errcode.ClientError, "用户名或密码错误")
 			return
 		}
-		response.FailWithCode(c, errcode.ClientError, "未知错误")
 	}
+
 	token, err := auth.GenerateToken(user.ID, user.Username, user.Role)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
+
 	response.Success(c, LoginVO{
 		Token:    token,
 		UserID:   user.ID,
@@ -108,7 +112,7 @@ func EnsureDefaultAdmin(db *gorm.DB) {
 	if count > 0 {
 		return
 	}
-	hashed, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+	hashed, _ := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
 	db.Create(&entity.UserDO{
 		BaseModel: entity.BaseModel{ID: idgen.NextIDStr()},
 		Username:  "admin",

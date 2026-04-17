@@ -61,3 +61,8 @@ var (
 var (
 	RemoteError = ErrorCode{"C000001", "调用第三方服务出错"}
 )
+
+// NewClientError creates a client-side AppError.
+func NewClientError(msg string) *AppError {
+	return &AppError{ErrorCode: ClientError, Msg: msg}
+}

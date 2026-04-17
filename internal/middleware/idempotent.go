@@ -3,6 +3,7 @@ package middleware
 import (
 	"gogent/pkg/errcode"
 	"gogent/pkg/response"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,13 +29,32 @@ import (
 //	Idempotent-Token: abc123-def456
 func IdempotentMiddleware(rdb *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		token := c.GetHeader("Idempotent-Token")
-		if token == "" {
-			response.FailWithCode(c, errcode.IdempotentTokenNullError, "幂等token为空")
-			c.Abort()
+		// Only protect write operations.
+		switch c.Request.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		default:
+			c.Next()
 			return
 		}
+
+		// Frontend does not send idempotent token for most requests.
+		// Keep Java-compatible behavior by enforcing dedup only when token exists.
+		if rdb == nil {
+			c.Next()
+			return
+		}
+
+		// 1. Get idempotent token from header
+		token := c.GetHeader("Idempotent-Token")
+		if token == "" {
+			c.Next()
+			return
+		}
+
+		// 2. Build Redis key
 		key := "idempotent:submit:" + token
+
+		// 3. Try to set token (SET NX = only set if not exists)
 		ctx := c.Request.Context()
 		success, err := rdb.SetNX(ctx, key, "1", 5*time.Minute).Result()
 		if err != nil {
@@ -42,11 +62,15 @@ func IdempotentMiddleware(rdb *redis.Client) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+
+		// 4. If key already exists, this is a duplicate request
 		if !success {
 			response.FailWithCode(c, errcode.IdempotentTokenDeleteError, "您操作太快，请稍后再试")
 			c.Abort()
 			return
 		}
+
+		// 5. Token is new, continue processing
 		c.Next()
 	}
 }

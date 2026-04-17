@@ -11,18 +11,22 @@ import (
 
 // AppConfig is the root configuration struct.
 type AppConfig struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Redis    RedisConfig    `mapstructure:"redis"`
-	Milvus   MilvusConfig   `mapstructure:"milvus"`
-	RAG      RAGConfig      `mapstructure:"rag"`
-	AI       AIConfig       `mapstructure:"ai"`
-	Storage  StorageConfig  `mapstructure:"storage"`
+	Server    ServerConfig    `mapstructure:"server"`
+	Database  DatabaseConfig  `mapstructure:"database"`
+	Redis     RedisConfig     `mapstructure:"redis"`
+	Milvus    MilvusConfig    `mapstructure:"milvus"`
+	RAG       RAGConfig       `mapstructure:"rag"`
+	AI        AIConfig        `mapstructure:"ai"`
+	Storage   StorageConfig   `mapstructure:"storage"`
+	Ingestion IngestionConfig `mapstructure:"ingestion"`
 }
 
 type ServerConfig struct {
-	Port        int    `mapstructure:"port"`
-	ContextPath string `mapstructure:"context-path"`
+	Port                int    `mapstructure:"port"`
+	ContextPath         string `mapstructure:"context-path"`
+	JWTSecret           string `mapstructure:"jwt-secret"`
+	DemoMode            bool   `mapstructure:"demo-mode"`
+	UploadMaxConcurrent int    `mapstructure:"upload-max-concurrent"`
 }
 
 type DatabaseConfig struct {
@@ -44,7 +48,36 @@ type MilvusConfig struct {
 }
 
 type StorageConfig struct {
-	BasePath string `mapstructure:"base-path"`
+	BasePath string   `mapstructure:"base-path"`
+	Type     string   `mapstructure:"type"`
+	S3       S3Config `mapstructure:"s3"`
+}
+
+type IngestionConfig struct {
+	Tika   TikaConfig   `mapstructure:"tika"`
+	Feishu FeishuConfig `mapstructure:"feishu"`
+	S3     S3Config     `mapstructure:"s3"`
+}
+
+type TikaConfig struct {
+	Endpoint  string `mapstructure:"endpoint"`
+	TimeoutMs int    `mapstructure:"timeout-ms"`
+}
+
+type FeishuConfig struct {
+	BaseURL string `mapstructure:"base-url"`
+}
+
+type S3Config struct {
+	Endpoint           string `mapstructure:"endpoint"`
+	Region             string `mapstructure:"region"`
+	AccessKeyID        string `mapstructure:"access-key-id"`
+	SecretAccessKey    string `mapstructure:"secret-access-key"`
+	Bucket             string `mapstructure:"bucket"`
+	BasePath           string `mapstructure:"base-path"`
+	UsePathStyle       bool   `mapstructure:"use-path-style"`
+	ReliableUpload     bool   `mapstructure:"reliable-upload"`
+	ReliableMaxRetries int    `mapstructure:"reliable-max-retries"`
 }
 
 type RAGConfig struct {
@@ -113,9 +146,16 @@ type SearchChannelsConfig struct {
 }
 
 type ChannelConfig struct {
+	Enabled             *bool   `mapstructure:"enabled"`  // nil = true (Java default on)
+	Priority            *int    `mapstructure:"priority"` // nil = use built-in channel default
 	ConfidenceThreshold float64 `mapstructure:"confidence-threshold"`
 	TopKMultiplier      int     `mapstructure:"top-k-multiplier"`
 	MinIntentScore      float64 `mapstructure:"min-intent-score"`
+}
+
+// ChannelEnabled returns true when cfg.Enabled is nil or explicitly true.
+func ChannelEnabled(cfg *bool) bool {
+	return cfg == nil || *cfg
 }
 
 // AIConfig mirrors Java AIModelProperties.
@@ -161,7 +201,7 @@ type ModelCandidate struct {
 }
 
 // IsEnabled returns true if Enabled is nil (default) or true.
-func (c *ModelCandidate) IsEnabled() bool {
+func (c ModelCandidate) IsEnabled() bool {
 	if c.Enabled == nil {
 		return true
 	}
@@ -181,6 +221,7 @@ func Load(path string) (*AppConfig, error) {
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+
 	var cfg AppConfig
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
@@ -191,8 +232,33 @@ func Load(path string) (*AppConfig, error) {
 		p.APIKey = resolveEnvPlaceholder(p.APIKey)
 		cfg.AI.Providers[name] = p
 	}
+	cfg.Storage.S3.Endpoint = resolveEnvPlaceholder(cfg.Storage.S3.Endpoint)
+	cfg.Storage.S3.AccessKeyID = resolveEnvPlaceholder(cfg.Storage.S3.AccessKeyID)
+	cfg.Storage.S3.SecretAccessKey = resolveEnvPlaceholder(cfg.Storage.S3.SecretAccessKey)
+	cfg.Storage.S3.Bucket = resolveEnvPlaceholder(cfg.Storage.S3.Bucket)
+
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
+	}
+
 	slog.Info("config loaded", "path", path)
 	return &cfg, nil
+}
+
+// validateConfig performs cross-field validation after config is loaded.
+func validateConfig(cfg *AppConfig) error {
+	if cfg.Server.JWTSecret == "" {
+		slog.Warn("jwt-secret is empty; using insecure default key — set server.jwt-secret in production")
+	}
+	if cfg.RAG.Memory.SummaryEnabled &&
+		cfg.RAG.Memory.SummaryStartTurns <= cfg.RAG.Memory.HistoryKeepTurns {
+		return fmt.Errorf("config error: rag.memory.summary-start-turns (%d) must be greater than history-keep-turns (%d) when summary is enabled",
+			cfg.RAG.Memory.SummaryStartTurns, cfg.RAG.Memory.HistoryKeepTurns)
+	}
+	if cfg.Server.UploadMaxConcurrent <= 0 {
+		cfg.Server.UploadMaxConcurrent = 3
+	}
+	return nil
 }
 
 // resolveEnvPlaceholder handles ${ENV_VAR:default} syntax.
@@ -203,7 +269,7 @@ func resolveEnvPlaceholder(val string) string {
 	inner := val[2 : len(val)-1]
 	parts := strings.SplitN(inner, ":", 2)
 	envVal := os.Getenv(parts[0])
-	if envVal == "" {
+	if envVal != "" {
 		return envVal
 	}
 	if len(parts) > 1 {

@@ -14,7 +14,6 @@ redis:
   password: ""
   db: 0
 
-
 milvus:
   uri: "http://localhost:19530"
 
@@ -138,3 +137,28 @@ ai:
         provider: noop
         model: noop
         priority: 100
+
+storage:
+  type: s3 # local / s3
+  base-path: "./data/uploads"
+  s3:
+    endpoint: "http://127.0.0.1:9000"
+    region: "us-east-1"
+    access-key-id: "${RUSTFS_ACCESS_KEY_ID:rustfsadmin}"
+    secret-access-key: "${RUSTFS_SECRET_ACCESS_KEY:rustfsadmin}"
+    bucket: "${RUSTFS_BUCKET:ragent}"
+    base-path: "uploads"
+    use-path-style: true
+    reliable-upload: true
+    reliable-max-retries: 3
+
+ingestion:
+  tika:
+    endpoint: "http://localhost:9998"
+    timeout-ms: 30000
+  feishu:
+    base-url: "https://open.feishu.cn"
+  s3:
+    endpoint: ""
+    region: "us-east-1"
+    use-path-style: false

@@ -50,6 +50,8 @@ type KnowledgeChunkDO struct {
 	CharCount   int    `gorm:"column:char_count" json:"charCount,omitempty"`
 	TokenCount  int    `gorm:"column:token_count" json:"tokenCount,omitempty"`
 	Enabled     int    `gorm:"column:enabled;default:1" json:"enabled"`
+	CreatedBy   string `gorm:"column:created_by;size:20" json:"createdBy,omitempty"`
+	UpdatedBy   string `gorm:"column:updated_by;size:20" json:"updatedBy,omitempty"`
 }
 
 func (KnowledgeChunkDO) TableName() string { return "t_knowledge_chunk" }
