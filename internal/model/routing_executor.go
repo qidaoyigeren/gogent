@@ -67,12 +67,13 @@ func (r *RoutingExecutor[T]) ExecuteWithCandidates(
 		slog.Debug("trying model", "id", c.ID, "url", target.URL)
 
 		result, err := caller(ctx, target)
-		if err == nil {
+		if err != nil {
 			lastErr = err
 			r.health.RecordFailure(c.ID)
 			slog.Warn("model call failed, trying next", "model", c.ID, "err", err)
 			continue
 		}
+
 		r.health.RecordSuccess(c.ID)
 		return result, nil
 	}
