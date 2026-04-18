@@ -66,3 +66,23 @@ var (
 func NewClientError(msg string) *AppError {
 	return &AppError{ErrorCode: ClientError, Msg: msg}
 }
+
+// NewClientErrorWith creates a client-side AppError with specific code.
+func NewClientErrorWith(code ErrorCode, msg string) *AppError {
+	return &AppError{ErrorCode: code, Msg: msg}
+}
+
+// NewServiceError creates a service-side AppError.
+func NewServiceError(msg string) *AppError {
+	return &AppError{ErrorCode: ServiceError, Msg: msg}
+}
+
+// NewServiceErrorWith creates a service-side AppError with specific code.
+func NewServiceErrorWith(code ErrorCode, msg string, cause error) *AppError {
+	return &AppError{ErrorCode: code, Msg: msg, Cause: cause}
+}
+
+// NewRemoteError creates a remote call AppError.
+func NewRemoteError(msg string, cause error) *AppError {
+	return &AppError{ErrorCode: RemoteError, Msg: msg, Cause: cause}
+}

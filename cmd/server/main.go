@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"gogent/internal/auth"
+	"gogent/internal/chat"
 	"gogent/internal/config"
 	"gogent/internal/entity"
 	"gogent/internal/handler"
@@ -14,14 +12,18 @@ import (
 	"gogent/internal/model"
 	"gogent/internal/rewrite"
 	"gogent/pkg/idgen"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -79,7 +81,9 @@ func main() {
 		cfg.AI.Selection.FailureThreshold,
 		cfg.AI.Selection.OpenDurationMs,
 	)
-	_ = model.NewSelector(healthStore)
+	selector := model.NewSelector(healthStore)
+	// LLM Chat
+	_ = chat.NewRoutingLLMService(cfg.AI, healthStore, selector)
 	// MappingHandler needs termMapper injection
 	termMapper := rewrite.NewEmptyTermMapper()
 	termMapper.ReloadMappings(loadTermMappings(db))
