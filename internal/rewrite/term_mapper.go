@@ -34,9 +34,7 @@ func NewEmptyTermMapper() *TermMapper {
 	return &TermMapper{}
 }
 
-// Normalize applies all enabled exact-match term mappings to the input text.
-// Rules are applied in priority-DESC / source-length-DESC order to ensure
-// higher-priority and longer rules take precedence.
+// 标准化处理
 func (m *TermMapper) Normalize(text string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -81,13 +79,7 @@ func sortMappings(mappings []TermMapping) []TermMapping {
 	return sorted
 }
 
-// applyMapping performs a safe substring replacement that avoids re-replacing
-// positions that already contain the target term — mirroring Java's
-// QueryTermMappingUtil.applyMapping logic.
-//
-// Example: source="平安保险" target="平安保司"
-// If the text already contains "平安保司" at some position the replacement is
-// skipped for that occurrence so it is not double-replaced.
+// 安全替换（避免重复替换）
 func applyMapping(text, source, target string) string {
 	if text == "" || source == "" || target == "" {
 		return text
