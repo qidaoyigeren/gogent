@@ -11,8 +11,7 @@ import (
 	"unicode/utf8"
 )
 
-// Parser 节点：RawBytes → RawText
-
+// ParserSettings 节点级 JSON：Type 非空时**强制**用该名字解析器；Rules 为 MIME 白名单。
 type ParserSettings struct {
 	Type  string       `json:"type"`
 	Rules []ParserRule `json:"rules"`
@@ -56,11 +55,13 @@ func (n *ParserNode) Execute(ctx context.Context, ingestCtx *IngestionContext, c
 		// fetcher 未识别类型时，用 Go 标准库基于文件头做兜底检测。
 		ingestCtx.MimeType = httpDetectMime(ingestCtx.RawBytes)
 	}
+
 	settings := parseParserSettings(config.Settings)
 	if !matchesParserRules(ingestCtx.MimeType, settings.Rules) {
 		// rules 是 pipeline 的安全阀：不允许的 MIME 直接失败，避免误解析未知文件。
 		return NewNodeResultError(fmt.Errorf("mime type %s is not allowed by parser settings", ingestCtx.MimeType))
 	}
+
 	parser, err := n.selectParser(settings, ingestCtx.MimeType, ingestCtx.RawBytes)
 	if err != nil {
 		return NewNodeResultError(err)
@@ -71,6 +72,10 @@ func (n *ParserNode) Execute(ctx context.Context, ingestCtx *IngestionContext, c
 	}
 	// 清洗后的 RawText 是后续 chunker、enhancer 的标准输入。
 	ingestCtx.RawText = TextCleanup(parsed.Text)
+	if ingestCtx.Document == nil {
+		ingestCtx.Document = &StructuredDocument{}
+	}
+	ingestCtx.Document.Content = ingestCtx.RawText
 	merged := map[string]interface{}{}
 	for k, v := range ingestCtx.Metadata {
 		merged[k] = v
@@ -122,6 +127,7 @@ func (n *ParserNode) selectParser(settings ParserSettings, mimeType string, raw 
 				return parser, nil
 			}
 		}
+		return nil, fmt.Errorf("parser type %s is not registered", settings.Type)
 	}
 	// 自动：按**注册顺序**取第一个 Supports；故 newDefaultDocumentParsers 中顺序决定优先级
 	for _, parser := range n.parsers {

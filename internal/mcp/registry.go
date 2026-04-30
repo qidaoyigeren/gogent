@@ -29,11 +29,12 @@ func (r *Registry) Register(executor MCPToolExecutor) {
 	defer r.mu.Unlock()
 
 	tool := executor.GetToolDefinition()
-	r.executors[executor.GetToolDefinition().ToolID] = executor
+	r.executors[tool.ToolID] = executor
 	slog.Info("MCP tool registered", "toolId", tool.ToolID, "name", tool.Name)
 }
 
 // Unregister 从注册中心移除工具执行器
+// 并发安全：使用写锁保护
 func (r *Registry) Unregister(toolID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -41,6 +42,10 @@ func (r *Registry) Unregister(toolID string) {
 }
 
 // GetExecutor 根据工具 ID 获取对应的执行器
+// 返回值：
+// - 找到：返回执行器和 nil
+// - 未找到：返回 nil 和错误
+// 并发安全：使用读锁保护
 func (r *Registry) GetExecutor(toolID string) (MCPToolExecutor, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -53,6 +58,10 @@ func (r *Registry) GetExecutor(toolID string) (MCPToolExecutor, error) {
 }
 
 // ListAllTools 返回所有已注册的工具定义
+// 用途：
+// 1. 展示给 LLM 进行工具选择
+// 2. 管理后台显示工具列表
+// 并发安全：使用读锁保护
 func (r *Registry) ListAllTools() []MCPTool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

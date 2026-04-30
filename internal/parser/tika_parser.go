@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// TikaParser：所有请求发往同一 base endpoint（如 http://tika:9998），路径固定 /tika、/meta、/detect/stream、/version。
 type TikaParser struct {
 	endpoint string
 	client   *http.Client
@@ -32,7 +33,7 @@ func NewTikaParser(cfg TikaConfig) *TikaParser {
 
 func (p *TikaParser) Parse(ctx context.Context, reader io.Reader, mimeType string) (string, error) {
 	// Tika 的 /tika 接口使用 PUT 上传原始文件流，响应体就是抽取后的文本。
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, p.endpoint+"/tika", reader)
+	req, err := http.NewRequestWithContext(ctx, "PUT", p.endpoint+"/tika", reader)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -49,6 +50,7 @@ func (p *TikaParser) Parse(ctx context.Context, reader io.Reader, mimeType strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 非 200 直接转成错误，让上层任务状态进入 failed。
 		return "", fmt.Errorf("tika returned status %d", resp.StatusCode)
 	}
 

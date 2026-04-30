@@ -43,11 +43,14 @@ type TraceDetailVO struct {
 	Nodes []entity.RagTraceNodeDO `json:"nodes"`
 }
 
+// PageRuns 按条件分页查询 run，再批量填充 userName。
+// 排序：start_time DESC（最新的 run 在前）。
+// 返回：[]VO, total, err。
 func (s *RagTraceQueryService) PageRuns(req TraceRunPageRequest) ([]TraceRunVO, int64, error) {
 	var list []entity.RagTraceRunDO
 	var total int64
 	q := s.db.Model(&entity.RagTraceRunDO{})
-
+	// 所有过滤条件都在同一个 query builder 上叠加
 	if req.TraceID != "" {
 		q = q.Where("trace_id = ?", req.TraceID)
 	}
@@ -60,7 +63,7 @@ func (s *RagTraceQueryService) PageRuns(req TraceRunPageRequest) ([]TraceRunVO, 
 	if req.Status != "" {
 		q = q.Where("status = ?", req.Status)
 	}
-
+	// 先 Count 再 Find：两次 SQL，但可以准确返回 total
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
@@ -68,6 +71,7 @@ func (s *RagTraceQueryService) PageRuns(req TraceRunPageRequest) ([]TraceRunVO, 
 		return nil, 0, err
 	}
 
+	// ---- 批量回填 userName，避免 N+1 ----
 	userIDs := make([]string, 0, len(list))
 	for _, r := range list {
 		if r.UserID != "" {
@@ -77,7 +81,8 @@ func (s *RagTraceQueryService) PageRuns(req TraceRunPageRequest) ([]TraceRunVO, 
 	usernameMap := make(map[string]string)
 	if len(userIDs) > 0 {
 		var users []entity.UserDO
-		_ = s.db.Where("id IN ?", userIDs).Select("id,username").Find(&users).Error
+		// 忽略错误：userName 属于增强字段，查不到也不应影响 trace 列表返回
+		_ = s.db.Where("id IN ?", userIDs).Select("id, username").Find(&users).Error
 		for _, u := range users {
 			usernameMap[u.ID] = u.Username
 		}

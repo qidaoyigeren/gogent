@@ -67,39 +67,43 @@ func (p *ScheduleRefreshProcessor) Process(ctx context.Context, lease *ScheduleL
 	heartbeat := p.lockMgr.StartHeartbeat(lease)
 	defer heartbeat.Stop()
 
+	// Get schedule info
 	var schedule entity.KnowledgeDocumentScheduleDO
 	if err := p.db.Where("id = ? AND deleted = 0", lease.ScheduleID).First(&schedule).Error; err != nil {
-		slog.Error("failed to load schedule", "schedule_id", lease.ScheduleID, "error", err)
+		slog.Warn("schedule not found", "scheduleID", lease.ScheduleID, "err", err)
 		return
 	}
 
 	var doc entity.KnowledgeDocumentDO
 	if err := p.db.Where("id = ? AND deleted = 0", schedule.DocID).First(&doc).Error; err != nil {
-		//文档不存在直接禁用schedule
-		p.disableSchedule(schedule.ID, "文档不存在")
-		slog.Error("failed to load document", "doc_id", schedule.DocID, "error", err)
+		// 文档不存在时禁用 schedule，避免调度器每轮扫描都重复失败。
+		p.disableSchedule(schedule.ID, "document missing")
+		slog.Warn("document not found", "docID", schedule.DocID, "err", err)
 		return
 	}
+
 	if !p.shouldRun(doc, schedule) {
-		//文档被禁用，非URL来源或cron被清空时，schedule被禁用
-		p.disableSchedule(schedule.ID, "文档被禁用")
+		// 文档被禁用、非 URL 来源或 cron 被清空时，schedule 不再具备执行条件。
+		p.disableSchedule(schedule.ID, "schedule disabled")
 		return
 	}
 
 	execID := p.createExec(schedule, doc)
 	if strings.EqualFold(doc.Status, "running") {
-		//文档已经在手动分块或者其他调度中运行，本次跳过
-		p.finishExec(execID, "skipped", "document is running")
-		p.updateScheduleState(schedule, "skipped", "document is running")
+		// 文档已经在手动分块或其他调度中运行时，本次调度跳过，避免并发刷新同一文档。
+		p.finishExec(execID, "skipped", "document already running")
+		p.updateScheduleState(schedule, "skipped", "")
 		return
 	}
 
 	if p.runner == nil {
-		p.finishExec(execID, "failed", "runner is nil")
-		p.updateScheduleState(schedule, "failed", "runner is nil")
+		p.finishExec(execID, "failed", "runner is not configured")
+		p.updateScheduleState(schedule, "failed", "runner is not configured")
 		return
 	}
+
 	if err := p.runner.RefreshDocument(ctx, doc.ID); err != nil {
+		// RefreshDocument 内部会更新文档状态和 chunk 日志；这里记录调度执行层面的失败。
 		p.finishExec(execID, "failed", err.Error())
 		p.updateScheduleState(schedule, "failed", err.Error())
 		slog.Error("scheduled document refresh failed",

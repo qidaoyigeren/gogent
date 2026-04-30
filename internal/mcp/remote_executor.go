@@ -13,6 +13,7 @@ type RemoteExecutor struct {
 	toolDef MCPTool // 工具定义
 }
 
+// NewRemoteExecutor 创建新的远程工具执行器
 func NewRemoteExecutor(client Client, toolDef MCPTool) *RemoteExecutor {
 	return &RemoteExecutor{
 		client:  client,
@@ -26,6 +27,17 @@ func (e *RemoteExecutor) GetToolDefinition() MCPTool {
 }
 
 // Execute 执行远程工具调用
+// 工作流程：
+// 1. 记录开始时间
+// 2. 调用 Client.CallTool
+// 3. 计算耗时
+// 4. 处理失败情况（返回错误响应）
+// 5. 处理空结果（返回错误响应）
+// 6. 返回成功响应
+//
+// 注意：
+// - 失败时返回 Success=false，不返回 error（保证调用链不中断）
+// - 记录耗时用于性能监控
 func (e *RemoteExecutor) Execute(ctx context.Context, req MCPRequest) (*MCPResponse, error) {
 	start := time.Now()
 

@@ -33,6 +33,18 @@ func parseStringListResponse(response string) []string {
 }
 
 // parseObjectResponse 将 LLM 返回解析成对象（map[string]interface{}）。
+//
+// 解析策略（降级顺序）：
+//  1. 优先按 JSON object 解析：{"key1": "value1", "key2": "value2"}
+//  2. JSON 失败则按行切分，每行按首个冒号切分为 key 和 value
+//
+// 使用场景：
+//   - EnhancerNode：元数据抽取（METADATA），如作者、日期、主题等
+//   - EnricherNode：块级元数据抽取（metadata）
+//
+// 设计要点：
+//   - strings.SplitN(line, ":", 2) 仅按首个冒号切分，允许值中包含冒号（如 URL）
+//   - 空行或不含冒号的行会被忽略，容错性强
 func parseObjectResponse(response string) map[string]interface{} {
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(response), &obj); err == nil {

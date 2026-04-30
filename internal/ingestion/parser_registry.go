@@ -29,6 +29,14 @@ type DocumentParser interface {
 }
 
 // newDefaultDocumentParsers 按优先级注册内置 parser。
+//
+// 注册顺序决定匹配优先级：
+//  1. markdown：匹配 MIME 含 "markdown" 的文档，直接转字符串（轻量）
+//  2. html：匹配 MIME 含 "html" 的文档，清理标签并保留块级换行（轻量）
+//  3. text：匹配 text/plain、其他 text/*、或 UTF-8 有效字节（轻量兜底）
+//  4. tika：仅当 tika != nil 时注册，支持所有非空二进制内容（重量级兜底）
+//
+// markdown/text/html 能快速处理常见文本类内容；Tika 放在最后作为二进制文档兜底。
 func newDefaultDocumentParsers(tika *internalparser.TikaParser) []DocumentParser {
 	parsers := []DocumentParser{
 		textDocumentParser{name: "markdown", match: func(mimeType string, _ []byte) bool {

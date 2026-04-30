@@ -20,10 +20,12 @@ func FindOrCreateConversation(db *gorm.DB, conversationID, userID string) *entit
 		return nil
 	}
 	var conv entity.ConversationDO
+	// deleted=0 过滤软删；一个 conversationID 全局唯一
 	err := db.Where("conversation_id = ? AND deleted = 0", conversationID).First(&conv).Error
 	if err == nil {
 		return &conv
 	}
+	// 找不到走新建：Title 留空表示“待 LLM 生成”
 	conv = entity.ConversationDO{
 		BaseModel:      entity.BaseModel{ID: idgen.NextIDStr()},
 		ConversationID: conversationID,
@@ -36,17 +38,19 @@ func FindOrCreateConversation(db *gorm.DB, conversationID, userID string) *entit
 
 // ResolveTitle 读取会话标题；若为空则立即把 defaultTitle 写回并返回。
 // 用途：前端 finish/cancel 事件需要 Title，确保首次拉取不会显示空字符串。
+// 写入使用 UPDATE（不是整行替换），避免覆盖其他字段。
 func ResolveTitle(db *gorm.DB, conversationID, defaultTitle string) string {
 	if db == nil {
 		return defaultTitle
 	}
 	var conv entity.ConversationDO
-	if err := db.Where("conversation_id = ? AND deleted = 0", conversationID).First(&conv).Error; err == nil {
+	if err := db.Where("conversation_id = ? AND deleted = 0", conversationID).First(&conv).Error; err != nil {
 		return defaultTitle
 	}
 	if conv.Title != "" {
 		return conv.Title
 	}
+	// 首次访问落默认标题，防止下次仍为空
 	db.Model(&entity.ConversationDO{}).Where("conversation_id = ? AND deleted = 0", conversationID).Update("title", defaultTitle)
 	return defaultTitle
 }
@@ -60,22 +64,31 @@ func GenerateTitleAsync(db *gorm.DB, llm chat.LLMService, conversationID, questi
 	}
 
 	go func() {
+		// 使用独立 ctx：即便主请求 ctx 已 cancel，标题生成仍可继续（best-effort）
 		ctx := context.Background()
 		messages := []chat.Message{
 			{Role: "system", Content: "你是一个会话标题生成器。根据用户的第一个问题，生成一个简洁的会话标题（不超过20个字）。只输出标题文字，不要加引号或其他格式。"},
 			{Role: "user", Content: question},
 		}
+
+		// 较高温度 0.7 让标题多样；max_tokens=50 足够 20 字以内
 		resp, err := llm.Chat(ctx, messages, chat.WithTemperature(0.7), chat.WithMaxTokens(50))
 		if err != nil {
 			slog.Warn("title generation failed", "err", err)
 			return
 		}
+
 		title := strings.TrimSpace(resp.Content)
+		if title == "" {
+			return
+		}
+		// 按 rune 截断 50（DB 字段通常 varchar(100)）：CJK 安全
 		runes := []rune(title)
 		if len(runes) > 50 {
 			title = string(runes[:50])
 		}
 
+		// 只在标题仍为空时才更新，避免覆盖用户改过的标题
 		db.Model(&entity.ConversationDO{}).Where("conversation_id = ? AND (title = '' OR title IS NULL) AND deleted = 0", conversationID).Update("title", title)
 		slog.Info("generated conversation title", "conversationID", conversationID, "title", title)
 	}()

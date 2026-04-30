@@ -22,25 +22,42 @@ type IntentNode struct {
 	ParamPromptTemplate string        `json:"paramPromptTemplate,omitempty"` // MCP 参数提取提示词
 }
 
+// IsLeaf 判断是否为叶子节点
+// 叶子节点：没有子节点的节点（通常是 detail 层级）
 func (n *IntentNode) IsLeaf() bool {
 	return len(n.Children) == 0
 }
 
+// FindChild finds a direct child by ID.
 // FindChild 方法用于在当前意图节点的子节点中查找指定ID的子节点
+// 参数:
+//
+//	id - 要查找的子节点的ID字符串
+//
+// 返回值:
+//
+//	*IntentNode - 如果找到匹配的子节点则返回该节点指针，否则返回nil
 func (n *IntentNode) FindChild(id string) *IntentNode {
+	// 遍历当前节点的所有子节点
 	for _, child := range n.Children {
+		// 检查当前子节点的ID是否与目标ID匹配
 		if child.ID == id {
+			// 如果找到匹配的子节点，立即返回该节点
 			return child
 		}
 	}
+	// 如果遍历完所有子节点都没有找到匹配项，则返回nil
 	return nil
 }
 
 // AllLeaves 收集子树下的所有叶子节点（递归）
+// 用途：意图分类时只针对叶子节点进行评分
 func (n *IntentNode) AllLeaves() []*IntentNode {
+	// 如果是叶子节点，返回自身
 	if n.IsLeaf() {
 		return []*IntentNode{n}
 	}
+	// 递归收集所有子节点的叶子
 	var leaves []*IntentNode
 	for _, child := range n.Children {
 		leaves = append(leaves, child.AllLeaves()...)
@@ -49,6 +66,7 @@ func (n *IntentNode) AllLeaves() []*IntentNode {
 }
 
 // FlattenAll 返回子树中的所有节点（BFS 广度优先遍历）
+// 用途：构建节点映射（nodeMap）用于快速查找
 func (n *IntentNode) FlattenAll() []*IntentNode {
 	var result []*IntentNode
 	queue := []*IntentNode{n}

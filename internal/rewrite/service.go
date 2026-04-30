@@ -10,8 +10,8 @@ import (
 // 1. Rewritten: 改写后的查询（更适合检索）
 // 2. SubQuestions: 拆分后的子问题列表（复杂问题）
 type RewriteResult struct {
-	Rewritten    string   `json:"rewritten"`
-	SubQuestions []string `json:"subQuestions,omitempty"`
+	Rewritten    string   `json:"rewritten"`              // 改写后的查询
+	SubQuestions []string `json:"subQuestions,omitempty"` // 子问题列表（可选）
 }
 
 // QueryRewriteService 查询改写服务接口
@@ -21,8 +21,10 @@ type RewriteResult struct {
 // 3. 补全指代词、删除无关指令、保留关键限制
 type QueryRewriteService interface {
 	// Rewrite 改写单个查询（不返回子问题）
+	// 用于简单查询场景，只需要改写不需要拆分
 	Rewrite(ctx context.Context, query string, history []chat.Message) (*RewriteResult, error)
 
 	// RewriteMulti 改写查询并拆分子问题
+	// 用于复杂问题场景，需要并行检索多个子问题
 	RewriteMulti(ctx context.Context, query string, history []chat.Message) (*RewriteResult, error)
 }

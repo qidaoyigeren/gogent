@@ -79,6 +79,7 @@ func (n *EnricherNode) Execute(ctx context.Context, ingestCtx *IngestionContext,
 	attachMetadata := settings.AttachDocumentMetadata == nil || *settings.AttachDocumentMetadata // 默认真：块级也带 doc 级键，方便向量过滤 kb_id 等
 	for i := range ingestCtx.Chunks {
 		if strings.TrimSpace(ingestCtx.Chunks[i].Content) == "" {
+			// 空 chunk 无法提供有效上下文，直接跳过。
 			continue
 		}
 		if ingestCtx.Chunks[i].Metadata == nil {
@@ -96,7 +97,7 @@ func (n *EnricherNode) Execute(ctx context.Context, ingestCtx *IngestionContext,
 				continue
 			}
 			systemPrompt := task.SystemPrompt
-			if strings.TrimSpace(systemPrompt) == "" {
+			if systemPrompt == "" {
 				systemPrompt = n.promptMgr.SystemPrompt(task.Type)
 			}
 			userPrompt := n.buildUserPrompt(task.UserPromptTemplate, &ingestCtx.Chunks[i], ingestCtx)

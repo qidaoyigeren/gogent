@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 )
 
-// FileStore abstracts document file persistence across local/S3 backends.
 type FileStore interface {
 	Save(fileName string, reader io.Reader) (string, error)
 	Load(storedPath string) (io.ReadCloser, error)

@@ -20,6 +20,11 @@ type ToolCallResult struct {
 }
 
 // Client MCP 客户端接口
+// 核心职责：
+// 1. Initialize: 建立与 MCP Server 的连接
+// 2. ListTools: 获取所有可用工具
+// 3. CallTool: 执行远程工具调用
+// 对齐 Java: MCPClient
 type Client interface {
 	// Initialize 建立与 MCP Server 的连接
 	Initialize(ctx context.Context) bool
@@ -30,6 +35,11 @@ type Client interface {
 }
 
 // HTTPClient 基于 HTTP 传输的 MCP 客户端实现
+// 核心职责：
+// 1. 实现 Client 接口的三个方法
+// 2. 使用 JSON-RPC 2.0 协议通信
+// 3. 处理超时、错误分类、响应解析
+// 对齐 Java: DefaultMCPClient
 type HTTPClient struct {
 	httpClient *http.Client // HTTP 客户端（带超时配置）
 	serverURL  string       // MCP Server URL
@@ -55,11 +65,15 @@ func NewHTTPClient(serverURL string) *HTTPClient {
 // 1. 发送 initialize 请求（包含协议版本、客户端信息）
 // 2. 等待服务器响应
 // 3. 发送 notifications/initialized 通知（MCP 协议要求）
+// 返回值：
+// - true: 初始化成功
+// - false: 初始化失败（记录错误日志）
 func (c *HTTPClient) Initialize(ctx context.Context) bool {
+	// 构建 initialize 请求参数
 	params := map[string]interface{}{
 		"protocolVersion": "2026-02-28", // MCP 协议版本
 		"clientInfo": map[string]string{
-			"name":    "gogent",
+			"name":    "go-ragent",
 			"version": "1.0.0",
 		},
 	}
@@ -81,14 +95,20 @@ func (c *HTTPClient) Initialize(ctx context.Context) bool {
 // 1. 发送 tools/list 请求
 // 2. 解析响应中的 tools 数组
 // 3. 转换为 MCPTool 结构体列表
+// 返回值：
+// - 成功：返回工具列表
+// - 失败：返回错误
 func (c *HTTPClient) ListTools(ctx context.Context) ([]MCPTool, error) {
 	result, err := c.sendRequest(ctx, "tools/list", map[string]interface{}{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tools: %w", err)
 	}
+
 	if result == nil {
 		return []MCPTool{}, nil
 	}
+
+	// 解析 tools 数组
 	toolsRaw, ok := result["tools"].([]interface{})
 	if !ok {
 		return []MCPTool{}, nil
@@ -109,6 +129,9 @@ func (c *HTTPClient) ListTools(ctx context.Context) ([]MCPTool, error) {
 }
 
 // CallTool 执行远程工具调用
+// 参数：
+// - toolName: 工具名称
+// - arguments: 工具参数（由 LLM 提取）
 // 工作流程：
 // 1. 验证参数（toolName 非空）
 // 2. 发送 tools/call 请求
@@ -129,26 +152,48 @@ func (c *HTTPClient) CallTool(ctx context.Context, toolName string, arguments ma
 		"name":      toolName,
 		"arguments": arguments,
 	}
+
 	result, err := c.sendRequest(ctx, "tools/call", params)
 	if err != nil {
 		return ToolCallResult{}, fmt.Errorf("failed to call tool %s: %w", toolName, err)
 	}
+
 	if result == nil {
 		return ToolCallResult{}, fmt.Errorf("tool call returned nil result")
 	}
 
+	// Extract text content
 	textResult := c.extractTextContent(result)
 
+	// Check if isError
 	isError, _ := result["isError"].(bool)
 	if isError {
 		slog.Warn("MCP tool call returned error", "tool", toolName, "error", textResult)
 		return ToolCallResult{}, fmt.Errorf("tool call error: %s", textResult)
 	}
+
 	out := ToolCallResult{Text: textResult}
 	if data := parseJSONObjectFromText(textResult); len(data) > 0 {
 		out.Data = data
 	}
 	return out, nil
+}
+
+// parseJSONObjectFromText 尝试将整个文本解析为 JSON 对象
+// 用途：对齐 Java MCPResponse#data 字段
+// 返回值：
+// - 成功：返回 map
+// - 失败：返回 nil（文本不是 JSON 或解析失败）
+func parseJSONObjectFromText(text string) map[string]interface{} {
+	s := strings.TrimSpace(text)
+	if len(s) < 2 || s[0] != '{' {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 // sendRequest 发送 JSON-RPC 2.0 请求
@@ -167,6 +212,7 @@ func (c *HTTPClient) CallTool(ctx context.Context, toolName string, arguments ma
 // - JSON 解析失败：返回错误
 // - JSON-RPC 错误：返回错误
 func (c *HTTPClient) sendRequest(ctx context.Context, method string, params map[string]interface{}) (map[string]interface{}, error) {
+	// 构建 JSON-RPC 请求
 	rpcRequest := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      c.requestID.Add(1), // 自增 ID
@@ -180,12 +226,14 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params map[
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// 创建 HTTP 请求
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// 发送请求
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		slog.Error("MCP request failed", "method", method, "url", url, "err", err)
@@ -198,12 +246,14 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params map[
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
+	// 读取响应体
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		slog.Warn("MCP request failed", "method", method, "url", url, "err", "response body is empty")
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// 解析 JSON-RPC 响应
 	var rpcResponse map[string]interface{}
 	if err := json.Unmarshal(body, &rpcResponse); err != nil {
 		slog.Error("MCP JSON parse error", "method", method, "url", url, "err", err)
@@ -230,6 +280,7 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params map[
 
 // sendInitializedNotification 发送 JSON-RPC 2.0 通知（无 id，不需要响应）
 // MCP 协议要求：initialize 之后必须发送 notifications/initialized
+// 注意：此方法失败不影响主流程（只记录警告日志）
 func (c *HTTPClient) sendInitializedNotification(ctx context.Context) {
 	notification := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -262,31 +313,12 @@ func (c *HTTPClient) sendInitializedNotification(ctx context.Context) {
 	}
 }
 
-// convertToMCPTool 将 MCP 标准 Tool Schema 转换为 MCPTool
-// 转换规则：
-// 1. name → ToolID + Name
-// 2. description → Description
-// 3. inputSchema → Parameters（JSON 格式）
-func (c *HTTPClient) convertToMCPTool(toolObj map[string]interface{}) MCPTool {
-	name, _ := toolObj["name"].(string)
-	description, _ := toolObj["description"].(string)
-
-	// 解析 inputSchema
-	var parameters json.RawMessage
-	if inputSchemaRaw, ok := toolObj["inputSchema"]; ok {
-		if inputSchema, ok := inputSchemaRaw.(map[string]interface{}); ok {
-			// 转换为 JSON
-			paramsJSON, _ := json.Marshal(inputSchema)
-			parameters = paramsJSON
-		}
+// resolveMCPEndpointURL resolves the MCP endpoint URL.
+func (c *HTTPClient) resolveMCPEndpointURL() string {
+	if strings.HasSuffix(c.serverURL, "/mcp") {
+		return c.serverURL
 	}
-
-	return MCPTool{
-		ToolID:      name,
-		Name:        name,
-		Description: description,
-		Parameters:  parameters,
-	}
+	return c.serverURL + "/mcp"
 }
 
 // extractTextContent 从工具调用结果中提取文本内容
@@ -327,27 +359,35 @@ func (c *HTTPClient) extractTextContent(result map[string]interface{}) string {
 	return strings.Join(textSegments, "\n")
 }
 
-// parseJSONObjectFromText 尝试将整个文本解析为 JSON 对象
-func parseJSONObjectFromText(text string) map[string]interface{} {
-	s := strings.TrimSpace(text)
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return nil
+// convertToMCPTool 将 MCP 标准 Tool Schema 转换为 MCPTool
+// 转换规则：
+// 1. name → ToolID + Name
+// 2. description → Description
+// 3. inputSchema → Parameters（JSON 格式）
+func (c *HTTPClient) convertToMCPTool(toolObj map[string]interface{}) MCPTool {
+	name, _ := toolObj["name"].(string)
+	description, _ := toolObj["description"].(string)
+
+	// 解析 inputSchema
+	var parameters json.RawMessage
+	if inputSchemaRaw, ok := toolObj["inputSchema"]; ok {
+		if inputSchema, ok := inputSchemaRaw.(map[string]interface{}); ok {
+			// 转换为 JSON
+			paramsJSON, _ := json.Marshal(inputSchema)
+			parameters = paramsJSON
+		}
 	}
-	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
-		return nil
+
+	return MCPTool{
+		ToolID:      name,
+		Name:        name,
+		Description: description,
+		Parameters:  parameters,
 	}
-	return m
 }
 
-// resolveMCPEndpointURL resolves the MCP endpoint URL.
-func (c *HTTPClient) resolveMCPEndpointURL() string {
-	if strings.HasSuffix(c.serverURL, "/mcp") {
-		return c.serverURL
-	}
-	return c.serverURL + "/mcp"
-}
-
+// isHTTPSuccess 检查 HTTP 状态码是否表示成功
+// 成功范围：200-299
 func isHTTPSuccess(statusCode int) bool {
 	return statusCode >= 200 && statusCode < 300
 }

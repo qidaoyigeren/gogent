@@ -46,12 +46,14 @@ type EnhanceTask struct {
 }
 
 // EnhancerNode enhances text using LLM.
+// Mirrors Java EnhancerNode with full LLM enhancement capabilities.
 type EnhancerNode struct {
 	llm       chat.LLMService
 	evaluator *ConditionEvaluator
 	promptMgr *EnhancerPromptManager
 }
 
+// NewEnhancerNode creates a new enhancer node.
 func NewEnhancerNode(llm chat.LLMService) *EnhancerNode {
 	return &EnhancerNode{
 		llm:       llm,
@@ -201,6 +203,7 @@ func (n *EnhancerNode) parseStringList(response string) []string {
 
 // parseObject 兼容 JSON object 和 key: value 文本，主要用于元数据抽取。
 func (n *EnhancerNode) parseObject(response string) map[string]interface{} {
+	// Try JSON object
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(response), &obj); err == nil {
 		return obj

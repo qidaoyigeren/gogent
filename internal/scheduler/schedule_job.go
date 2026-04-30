@@ -37,6 +37,13 @@ type KnowledgeDocumentScheduleJob struct {
 }
 
 // NewKnowledgeDocumentScheduleJob 创建知识文档定时调度任务实例。
+//
+// 参数说明：
+//   - db:          数据库连接实例，用于查询调度记录和更新文档状态
+//   - lockMgr:     分布式锁管理器，确保同一调度记录在同一时刻只被一个实例处理
+//   - refreshProc: 调度刷新处理器，实际执行文档向量化等耗时操作
+//   - scanDelaySec: 扫描间隔（秒），控制 scanJob 的轮询频率，默认 10 秒
+//   - batchSize:    批处理大小，同时也是 executor 工作协程的数量，默认 5
 func NewKnowledgeDocumentScheduleJob(
 	db *gorm.DB,
 	lockMgr *ScheduleLockManager,
@@ -112,7 +119,7 @@ func (j *KnowledgeDocumentScheduleJob) executorWorker() {
 }
 
 // recoveryJob 定期恢复长时间卡在 RUNNING 状态的文档。
-// 每 60 秒执行一次。
+// 对应 Java 端 recoverStuckRunningDocuments() 方法，每 60 秒执行一次。
 // 典型场景：进程崩溃或网络中断导致文档状态未能正常更新，此任务将其标记为失败以便重新调度。
 func (j *KnowledgeDocumentScheduleJob) recoveryJob() {
 	defer j.wg.Done()
@@ -138,6 +145,7 @@ func (j *KnowledgeDocumentScheduleJob) recoveryJob() {
 }
 
 // scanJob 定期扫描需要处理的调度记录。
+// 对应 Java 端 scan() 方法，每 scanDelaySec 秒执行一次。
 // 核心逻辑：查询到期且未被锁定的调度记录，获取分布式锁后投入 executor 工作池执行。
 func (j *KnowledgeDocumentScheduleJob) scanJob() {
 	defer j.wg.Done()

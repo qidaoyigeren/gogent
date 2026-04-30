@@ -102,9 +102,16 @@ func NewRateLimiter(rdb *redis.Client, cfg RateLimitConfig) *RateLimiter {
 }
 
 // Acquire 按严格 FIFO 排队获取 slot；成功返回 leaseID，超时/出错返回 err。
+// 调用方用法：
+//
+//	leaseID, err := limiter.Acquire(ctx, userID)
+//	if err != nil { 返回限流提示 }
+//	defer limiter.Release(context.Background(), leaseID)
+//
+// userID 目前仅预留，未来可做按租户公平性；当前实现全局 FIFO。
 func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID string, err error) {
 	_ = userID
-
+	// 未开启时直接放行，方便本地开发
 	if !l.cfg.Enabled {
 		return "", nil
 	}
@@ -128,32 +135,40 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 	timeout := time.Duration(l.cfg.MaxWaitSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
 	// ---- 3) 订阅 release 通知，降低 polling 间隔 ----
 	notifyCtx, notifyCancel := context.WithCancel(ctx)
 	defer notifyCancel()
 	notifyCh := l.startPubSub(notifyCtx)
 	defer notifyCh.close()
+
 	// ---- 4) 轮询 ticker：pubsub 漏消息时兜底；生产中常见网络抖动场景 ----
 	ticker := time.NewTicker(time.Duration(l.cfg.PollIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
+
 	for {
 		// 先等唤醒事件：超时/停机/有 release/固定 poll
 		select {
 		case <-ctx.Done():
 			return "", fmt.Errorf("rate limit timeout")
+
 		case <-l.stopCh:
-			return "", fmt.Errorf("rate limit stopped")
-		case <-notifyCh.c: // 收到 release 事件时 tick 一下
-		case <-ticker.C: // 固定 poll
+			return "", fmt.Errorf("rate limiter stopped")
+
+		case <-notifyCh.c:
+		case <-ticker.C:
 		}
+
+		// 当前还有多少空 slot；没空继续等
 		avail := l.availablePermits(ctx)
 		if avail <= 0 {
 			continue
 		}
-		// ---- 5) 判定是否队头，原子拿走 slot ----
+
+		// 判我是不是“队头 avail 个”之一；不是就继续等下一轮
 		claimed, err := l.claimIfHead(ctx, requestID, avail)
 		if err != nil {
-			return "", fmt.Errorf("claim failed: %w", err)
+			return "", err
 		}
 		if !claimed {
 			continue
@@ -166,6 +181,7 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 		}
 
 		// claim 成功但抢 slot 失败：把自己重新入队（用新 seq，排到队尾，保证公平）
+		// 对齐 Java 版本的重排策略
 		newSeq, incErr := l.rdb.Incr(ctx, l.queueSeqKey).Result()
 		if incErr != nil {
 			return "", fmt.Errorf("queue seq re-incr: %w", incErr)
@@ -178,6 +194,92 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 	}
 }
 
+// availablePermits 返回当前剩余可用 slot 数；Redis 故障时保守返回 0。
+func (l *RateLimiter) availablePermits(ctx context.Context) int {
+	n, err := l.rdb.SCard(ctx, l.semaphoreKey).Result()
+	if err != nil {
+		return 0
+	}
+	avail := l.cfg.MaxConcurrent - int(n)
+	if avail < 0 {
+		return 0
+	}
+	return avail
+}
+
+// claimIfHead 通过 Lua 原子地尝试把自己从队头 avail 个窗口里拿走（ZRem）。
+// 返回 true 表示“本请求获得出队资格”，但还需要继续抢 slot。
+func (l *RateLimiter) claimIfHead(ctx context.Context, requestID string, avail int) (bool, error) {
+	res, err := l.rdb.Eval(ctx, claimQueueHeadLua, []string{l.queueKey}, requestID, avail).Result()
+	if err != nil {
+		return false, err
+	}
+	arr, ok := res.([]interface{})
+	if !ok || len(arr) == 0 {
+		return false, nil
+	}
+	okVal := parseRedisLong(arr[0])
+	return okVal == 1, nil
+}
+
+// parseRedisLong 将 Redis Eval 返回的多种整型兜底解析为 int64。
+// go-redis 在不同版本/协议下可能返回 int/int64/string，要统一处理。
+func parseRedisLong(v interface{}) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case string:
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	default:
+		return 0
+	}
+}
+
+// tryAcquire 用 Lua 原子 “SCARD 检查 + SADD” 抢一个 slot。
+// 成功返回 leaseID（lease:<unix-nano>），失败返回错误。
+// SET 本身带 EXPIRE（leaseSeconds）：宿主突然挂掉也不会让 slot 永占。
+func (l *RateLimiter) tryAcquire(ctx context.Context) (string, error) {
+	script := `
+		local count = redis.call('SCARD', KEYS[1])
+		if count < tonumber(ARGV[1]) then
+			local lease_id = ARGV[2]
+			redis.call('SADD', KEYS[1], lease_id)
+			redis.call('EXPIRE', KEYS[1], ARGV[3])
+			return lease_id
+		end
+		return nil
+	`
+
+	leaseID := fmt.Sprintf("lease:%d", time.Now().UnixNano())
+	result, err := l.rdb.Eval(ctx, script, []string{l.semaphoreKey},
+		l.cfg.MaxConcurrent, leaseID, l.cfg.LeaseSeconds).Result()
+
+	if err != nil {
+		return "", err
+	}
+
+	if result == nil {
+		return "", fmt.Errorf("no available slots")
+	}
+
+	return result.(string), nil
+}
+
+// Release 归还 slot 并 publish 通知下一个等待者。
+// 用 Background ctx：即使业务 ctx 已 cancel，slot 也必须归还。
+func (l *RateLimiter) Release(ctx context.Context, leaseID string) {
+	if !l.cfg.Enabled || leaseID == "" {
+		return
+	}
+
+	l.rdb.SRem(ctx, l.semaphoreKey, leaseID)
+	l.notifyAll(ctx)
+}
+
+// pubSubHandle 封装“通知 channel”+“关闭 channel”，上层 defer close 即可释放后台订阅协程。
 type pubSubHandle struct {
 	c    <-chan struct{} // 收到 release 事件时 tick 一下
 	done chan struct{}   // 主动关闭信号
@@ -222,85 +324,9 @@ func (l *RateLimiter) startPubSub(parent context.Context) *pubSubHandle {
 	return &pubSubHandle{c: out, done: done}
 }
 
-// availablePermits 返回当前剩余可用 slot 数；Redis 故障时保守返回 0。
-func (l *RateLimiter) availablePermits(ctx context.Context) int {
-	n, err := l.rdb.SCard(ctx, l.semaphoreKey).Result()
-	if err != nil {
-		return 0
-	}
-	avail := l.cfg.MaxConcurrent - int(n)
-	return max(0, avail)
-}
-
-// claimIfHead 通过 Lua 原子地尝试把自己从队头 avail 个窗口里拿走（ZRem）。
-// 返回 true 表示“本请求获得出队资格”，但还需要继续抢 slot。
-func (l *RateLimiter) claimIfHead(ctx context.Context, requestID string, avail int) (bool, error) {
-	res, err := l.rdb.Eval(ctx, claimQueueHeadLua, []string{l.queueKey}, requestID, avail).Result()
-	if err != nil {
-		return false, fmt.Errorf("claim queue head: %w", err)
-	}
-	arr, ok := res.([]interface{})
-	if !ok || len(arr) == 0 {
-		return false, nil
-	}
-	okVal := parseRedisLong(arr[0])
-	return okVal == 1, nil
-}
-
-// parseRedisLong 将 Redis Eval 返回的多种整型兜底解析为 int64。
-// go-redis 在不同版本/协议下可能返回 int/int64/string，要统一处理。
-func parseRedisLong(v interface{}) int64 {
-	switch v := v.(type) {
-	case int64:
-		return v
-	case int:
-		return int64(v)
-	case string:
-		n, _ := strconv.ParseInt(v, 10, 64)
-		return n
-	default:
-		return 0
-	}
-}
-
-// tryAcquire 用 Lua 原子 “SCARD 检查 + SADD” 抢一个 slot。
-// 成功返回 leaseID（lease:<unix-nano>），失败返回错误。
-// SET 本身带 EXPIRE（leaseSeconds）：宿主突然挂掉也不会让 slot 永占。
-func (l *RateLimiter) tryAcquire(ctx context.Context) (string, error) {
-	script := `
-	local count = redis.call('SCARD', KEYS[1])
-	if count < tonumber(ARGV[1]) then
-		local lease_id = ARGV[2]
-		redis.call('SADD', KEYS[1], lease_id)
-		redis.call('EXPIRE', KEYS[1], ARGV[3])
-		return lease_id
-	end
-	return nil
-	`
-	leaseID := fmt.Sprintf("lease:%d", time.Now().UnixNano())
-	result, err := l.rdb.Eval(ctx, script, []string{l.semaphoreKey}, l.cfg.MaxConcurrent, leaseID, l.cfg.LeaseSeconds).Result()
-	if err != nil {
-		return "", fmt.Errorf("try acquire: %w", err)
-	}
-	if result == nil {
-		return "", fmt.Errorf("no available slots")
-	}
-	return result.(string), nil
-}
-
 // notifyAll 向 pubsub 广播“有 slot 释放了”；所有实例的等待协程都会被唤醒重试。
 func (l *RateLimiter) notifyAll(ctx context.Context) {
 	l.rdb.Publish(ctx, l.pubsubChannel, "available")
-}
-
-// Release 归还 slot 并 publish 通知下一个等待者。
-// 用 Background ctx：即使业务 ctx 已 cancel，slot 也必须归还。
-func (l *RateLimiter) Release(ctx context.Context, leaseID string) {
-	if !l.cfg.Enabled || leaseID == "" {
-		return
-	}
-	l.rdb.SRem(ctx, l.semaphoreKey, leaseID)
-	l.notifyAll(ctx)
 }
 
 // Stop 由 main 在关停时调用，通知所有 Acquire 协程尽快退出。

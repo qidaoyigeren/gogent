@@ -19,6 +19,10 @@ const (
 )
 
 // RAGPromptService RAG 提示词构建服务
+// 核心职责：
+// 1. 根据场景选择提示模板（KB/MCP/Mixed）
+// 2. 组装完整消息列表（system + evidence + history + user）
+// 3. 支持对话摘要注入
 type RAGPromptService struct {
 	loader *templateLoader
 }
@@ -35,6 +39,15 @@ func NewRAGPromptService() *RAGPromptService {
 // 4. 添加证据上下文（MCP 结果 + 知识库文档）
 // 5. 添加对话历史
 // 6. 添加当前查询（多子问题时编号）
+//
+// 参数说明：
+// - query: 改写后的查询
+// - subQuestions: 拆分的子问题列表
+// - summary: 对话摘要（压缩的老对话）
+// - chunks: 知识库检索结果
+// - mcpResults: MCP 工具调用结果
+// - intentTemplate: 意图节点的自定义模板（优先级最高）
+// - history: 最近对话历史
 func (s *RAGPromptService) BuildPrompt(
 	query string,
 	subQuestions []string,
@@ -46,15 +59,18 @@ func (s *RAGPromptService) BuildPrompt(
 ) []chat.Message {
 	// 1. 检测场景（根据是否有 KB chunks 和 MCP results）
 	scenario := s.detectScenario(chunks, mcpResults)
+
 	// 2. 构建系统提示词
 	var systemPrompt string
 	if strings.TrimSpace(intentTemplate) != "" {
+		// 优先级 1：使用意图节点的自定义模板
 		systemPrompt = fillSlots(intentTemplate, map[string]string{
 			"kb_context":  "",
 			"mcp_context": "",
 			"summary":     summary,
 		})
 	} else {
+		// 优先级 2：根据场景选择默认模板
 		switch scenario {
 		case ScenarioKBOnly:
 			systemPrompt = s.buildKBOnlyPrompt()
@@ -64,6 +80,7 @@ func (s *RAGPromptService) BuildPrompt(
 			systemPrompt = s.buildMixedPrompt()
 		}
 	}
+
 	// 3. 注入对话摘要（前缀）
 	if summary != "" {
 		systemPrompt = fmt.Sprintf("对话摘要：%s\n\n%s", summary, systemPrompt)
@@ -86,8 +103,10 @@ func (s *RAGPromptService) BuildPrompt(
 			Content: formatEvidence("## 文档内容", kbContext),
 		})
 	}
+
 	// 6. 添加对话历史
 	messages = append(messages, history...)
+
 	// 7. 添加当前查询（多子问题时编号）
 	messages = append(messages, chat.Message{Role: "user", Content: buildUserMessage(query, subQuestions)})
 
@@ -95,21 +114,27 @@ func (s *RAGPromptService) BuildPrompt(
 }
 
 // detectScenario 检测提示词场景
+// 判断逻辑：
+// 1. 如果有 KB chunks 且有成功的 MCP results → Mixed
+// 2. 如果只有成功的 MCP results → MCPOnly
+// 3. 否则 → KBOnly
 func (s *RAGPromptService) detectScenario(chunks []retrieve.DocumentChunk, mcpResults []*mcp.MCPResponse) ScenarioType {
 	hasKB := len(chunks) > 0
 	hasMCP := false
-	for _, result := range mcpResults {
-		if result != nil && result.Success {
+	for _, r := range mcpResults {
+		if r != nil && r.Success {
 			hasMCP = true
 			break
 		}
 	}
+
 	if hasKB && hasMCP {
 		return ScenarioMixed
-	} else if hasKB {
-		return ScenarioKBOnly
 	}
-	return ScenarioMCPOnly
+	if hasMCP {
+		return ScenarioMCPOnly
+	}
+	return ScenarioKBOnly
 }
 
 const (
@@ -120,36 +145,20 @@ const (
 
 func (s *RAGPromptService) buildKBOnlyPrompt() string {
 	tpl := s.loader.load("rag-kb.txt", kbTemplateFallback)
-	return fillSlots(tpl, map[string]string{"kb_content": ""})
+	return fillSlots(tpl, map[string]string{"kb_context": ""})
 }
 
 func (s *RAGPromptService) buildMCPOnlyPrompt() string {
 	tpl := s.loader.load("rag-mcp.txt", mcpTemplateFallback)
-	return fillSlots(tpl, map[string]string{"mcp_content": ""})
+	return fillSlots(tpl, map[string]string{"mcp_context": ""})
 }
 
 func (s *RAGPromptService) buildMixedPrompt() string {
 	tpl := s.loader.load("rag-mixed.txt", mixedTemplateFallback)
-	return fillSlots(tpl, map[string]string{"kb_content": "", "mcp_content": ""})
-}
-
-// formatMCPContext 格式化 MCP 工具结果
-// 输出格式：
-// [工具: tool-id] 结果: xxx
-// [工具: tool-id] 调用失败: error
-func formatMCPContext(mcpResults []*mcp.MCPResponse) string {
-	var sb strings.Builder
-	for _, r := range mcpResults {
-		if r == nil {
-			continue
-		}
-		if r.Success {
-			sb.WriteString(fmt.Sprintf("[工具: %s] 结果: %s\n", r.ToolID, r.TextResult))
-		} else {
-			sb.WriteString(fmt.Sprintf("[工具: %s] 调用失败: %s\n", r.ToolID, r.ErrorMsg))
-		}
-	}
-	return strings.TrimSpace(sb.String())
+	return fillSlots(tpl, map[string]string{
+		"kb_context":  "",
+		"mcp_context": "",
+	})
 }
 
 // formatEvidence 格式化证据块（带标题）
@@ -199,6 +208,25 @@ func formatChunksBySubQuestion(chunks []retrieve.DocumentChunk) string {
 		for _, c := range groups[q] {
 			sb.WriteString(fmt.Sprintf("[文档%d] (来源: %s, 置信度: %.2f)\n%s\n\n", docNo, c.KBID, c.Score, c.Content))
 			docNo++
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// formatMCPContext 格式化 MCP 工具结果
+// 输出格式：
+// [工具: tool-id] 结果: xxx
+// [工具: tool-id] 调用失败: error
+func formatMCPContext(mcpResults []*mcp.MCPResponse) string {
+	var sb strings.Builder
+	for _, r := range mcpResults {
+		if r == nil {
+			continue
+		}
+		if r.Success {
+			sb.WriteString(fmt.Sprintf("[工具: %s] 结果: %s\n", r.ToolID, r.TextResult))
+		} else {
+			sb.WriteString(fmt.Sprintf("[工具: %s] 调用失败: %s\n", r.ToolID, r.ErrorMsg))
 		}
 	}
 	return strings.TrimSpace(sb.String())

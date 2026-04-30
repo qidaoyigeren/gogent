@@ -20,14 +20,13 @@ import (
 //   - DeleteByDocID：文档删除时级联清理 schedule 和执行历史（事务保证原子性）
 //
 // syncSchedule 内部逻辑：
-//   1. 只允许 URL 来源文档（文件无法重新拉取）
-//   2. 文档被禁用时强制关闭 schedule（docEnabled = false）
-//   3. enabled=true 且 cron 非空时计算 next_run_time 写入表，供 schedule_job 扫描
-//   4. enabled=false 时 next_run_time 留 NULL，schedule_job 不会扫到该行
+//  1. 只允许 URL 来源文档（文件无法重新拉取）
+//  2. 文档被禁用时强制关闭 schedule（docEnabled = false）
+//  3. enabled=true 且 cron 非空时计算 next_run_time 写入表，供 schedule_job 扫描
+//  4. enabled=false 时 next_run_time 留 NULL，schedule_job 不会扫到该行
 //
 // computeNextRunTime 连续调用两次 schedule.Next 校验 cron 可持续触发，
 // 同时检查 minIntervalSeconds 防止频率过高。
-
 type KnowledgeDocumentScheduleService struct {
 	db                 *gorm.DB
 	minIntervalSeconds int64

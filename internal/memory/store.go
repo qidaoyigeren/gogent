@@ -26,6 +26,10 @@ type MessageRecord struct {
 func (MessageRecord) TableName() string { return "t_message" }
 
 // SummaryRecord 对话摘要记录结构体，映射到 t_conversation_summary 表
+// 核心职责：
+// 1. 存储压缩后的对话摘要（LLM 生成）
+// 2. 关联到会话（conversation_id + user_id）
+// 3. 支持多条摘要（历史记录）
 type SummaryRecord struct {
 	ID             string    `gorm:"column:id;primaryKey;size:20"`
 	ConversationID string    `gorm:"column:conversation_id;size:20;index"`
@@ -39,6 +43,11 @@ type SummaryRecord struct {
 
 func (SummaryRecord) TableName() string { return "t_conversation_summary" }
 
+// Store 消息持久化存储层（基于 GORM）
+// 核心职责：
+// 1. 消息读写（SaveMessage, LoadRecentMessages）
+// 2. 摘要读写（SaveSummary, LoadLatestSummary）
+// 3. 会话元数据更新（TouchConversation）
 type Store struct {
 	db *gorm.DB
 }
@@ -48,6 +57,7 @@ func NewStore(db *gorm.DB) *Store {
 }
 
 // conversationRow 会话行结构体，用于更新 t_conversation 表
+// 设计原因：避免导入 entity 包导致循环依赖
 type conversationRow struct {
 	ID             string     `gorm:"column:id;primaryKey"`
 	ConversationID string     `gorm:"column:conversation_id"`
@@ -62,6 +72,12 @@ type conversationRow struct {
 func (conversationRow) TableName() string { return "t_conversation" }
 
 // TouchConversation 更新会话的 last_time 字段（UPSERT 操作）
+// 触发时机：每次追加 USER 消息时调用
+// 核心职责：
+// 1. 如果会话不存在，创建新会话
+// 2. 如果会话存在，更新 last_time 为当前时间
+// 3. 保证会话列表按"最近使用"排序
+// 对齐 Java: JdbcConversationMemoryStore#append
 func (s *Store) TouchConversation(ctx context.Context, conversationID, userID, title string) {
 	now := time.Now()
 	row := conversationRow{
@@ -80,6 +96,10 @@ func (s *Store) TouchConversation(ctx context.Context, conversationID, userID, t
 }
 
 // SaveMessage 持久化聊天消息，返回生成的消息 ID
+// 核心职责：
+// 1. 生成唯一消息 ID（Snowflake）
+// 2. 从上下文获取用户 ID（auth.GetUserID）
+// 3. 保存到 t_message 表
 func (s *Store) SaveMessage(ctx context.Context, conversationID string, msg chat.Message) (string, error) {
 	id := idgen.NextIDStr()
 	record := MessageRecord{
@@ -93,6 +113,11 @@ func (s *Store) SaveMessage(ctx context.Context, conversationID string, msg chat
 }
 
 // LoadRecentMessages 加载会话的最近 N 条消息
+// 核心职责：
+// 1. 按 create_time 倒序查询（最新在前）
+// 2. 过滤已删除消息（deleted = 0）
+// 3. 反转为正序（ chronological order ）
+// 注意：limit = keepTurns * 2（每轮 2 条消息：user + assistant）
 func (s *Store) LoadRecentMessages(ctx context.Context, conversationID string, limit int) ([]chat.Message, error) {
 	var records []MessageRecord
 	err := s.db.WithContext(ctx).
@@ -116,6 +141,7 @@ func (s *Store) LoadRecentMessages(ctx context.Context, conversationID string, l
 }
 
 // CountMessages 统计会话的消息总数（未删除）
+// 用途：判断是否需要触发摘要压缩
 func (s *Store) CountMessages(ctx context.Context, conversationID string) (int64, error) {
 	var count int64
 	err := s.db.WithContext(ctx).
@@ -126,6 +152,11 @@ func (s *Store) CountMessages(ctx context.Context, conversationID string) (int64
 }
 
 // SaveSummary 持久化对话摘要
+// 核心职责：
+// 1. 生成唯一摘要 ID
+// 2. 从上下文获取用户 ID
+// 3. 保存到 t_conversation_summary 表
+// 注意：每次压缩都创建新记录（不更新旧记录）
 func (s *Store) SaveSummary(ctx context.Context, conversationID string, summary string) error {
 	record := SummaryRecord{
 		ID:             idgen.NextIDStr(),
@@ -137,6 +168,10 @@ func (s *Store) SaveSummary(ctx context.Context, conversationID string, summary 
 }
 
 // LoadLatestSummary 加载最新的对话摘要
+// 核心职责：
+// 1. 按 create_time 倒序查询
+// 2. 过滤已删除摘要
+// 3. 如果无摘要，返回空字符串（非错误）
 func (s *Store) LoadLatestSummary(ctx context.Context, conversationID string) (string, error) {
 	var record SummaryRecord
 	err := s.db.WithContext(ctx).

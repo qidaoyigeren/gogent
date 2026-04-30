@@ -6,19 +6,7 @@ import (
 	"unicode"
 )
 
-//chunk_strategy.go 实现两种核心分块策略。
-//
-// 1. fixedSizeChunkingStrategy（fixed_size）
-//    - 以字符为窗口，ChunkSize 控制块大小，OverlapSize 控制重叠
-//    - adjustFixedBoundary 在目标切点附近向前查找换行/句末，减少语义断裂
-//    - normalizeChunkText 做分块前文本规整：合并中文硬换行、还原被断开的 URL
-//
-// 2. structureAwareChunkingStrategy（structure_aware）
-//    - segmentStructureAwareBlocks 识别 Markdown 标题、围栏代码块、图片链接和段落
-//    - packStructureAwareBlocks 把结构块打包成接近 targetChars 的 chunk 范围
-//    - materializeStructureAware 按范围切出文本，并可附加 overlapChars 重叠
-//
-// 两种策略通过 ChunkingStrategy 接口接入 chunker，可随时扩展新策略注册到 registry。
+// chunk_strategy：fixed_size 用 rune 窗口滑动 + 边界回退；structure_aware 先按行扫出「结构块」再贪婪合并到 targetChars 附近。
 
 type ChunkingStrategy interface {
 	Mode() ChunkingMode
@@ -57,17 +45,19 @@ func (fixedSizeChunkingStrategy) Split(text string, settings ChunkerSettings) []
 	if len(runes) <= chunkSize {
 		return []string{normalized}
 	}
+
+	// step：下一块起点相对上一块终点「向前挪多少」；overlap≥chunkSize 时退化为整块步进，避免死循环
 	step := chunkSize - overlap
 	if step <= 0 {
 		step = chunkSize
 	}
 	chunks := make([]string, 0, (len(runes)/step)+1)
-	lastEnd := -1
+	lastEnd := -1 // 防 adjust 回退过头导致 end<=lastEnd 的退化路径
 	for start := 0; start < len(runes); {
-		targetEnd := min(start+chunkSize, len(runes))
+		targetEnd := minInt(start+chunkSize, len(runes))
 		end := adjustFixedBoundary(runes, start, targetEnd, overlap)
 		if end <= start || end <= lastEnd {
-			end = targetEnd
+			end = targetEnd // 边界调整失败则硬切，保证前进
 		}
 		chunk := strings.TrimSpace(string(runes[start:end]))
 		if chunk != "" {
@@ -77,9 +67,9 @@ func (fixedSizeChunkingStrategy) Split(text string, settings ChunkerSettings) []
 		if end >= len(runes) {
 			break
 		}
-		nextStart := max(0, end-overlap)
+		nextStart := maxInt(0, end-overlap)
 		if nextStart <= start {
-			nextStart = end
+			nextStart = end // overlap 太大时至少前进到 end，避免无限循环
 		}
 		start = nextStart
 	}
@@ -107,6 +97,192 @@ func (structureAwareChunkingStrategy) Split(text string, settings ChunkerSetting
 		return []string{text}
 	}
 	return materializeStructureAware(text, ranges, settings.OverlapChars)
+}
+
+type structureBlockKind int
+
+const (
+	blockHeading structureBlockKind = iota
+	blockCode
+	blockAtomic
+	blockParagraph
+)
+
+type structureBlock struct {
+	kind  structureBlockKind
+	start int
+	end   int
+}
+
+var (
+	headingPattern     = regexp.MustCompile(`^#{1,6}\s+.*$`)
+	codeFencePattern   = regexp.MustCompile("^```.*$")
+	atomicImagePattern = regexp.MustCompile(`^!\[[^]]*]\([^)]+\)(?:\s*"[^"]*")?\s*$`)
+	atomicLinkPattern  = regexp.MustCompile(`^\[[^]]+]\([^)]+\)\s*$`)
+)
+
+// segmentStructureAwareBlocks 扫描文本并产出结构块范围。
+// 它识别标题、围栏代码块、图片/链接原子块和普通段落，返回的是原文 byte 区间，
+// 这样后续 materialize 时可以保留原始内容格式。
+func segmentStructureAwareBlocks(text string) []structureBlock {
+	blocks := make([]structureBlock, 0)
+	n := len(text)
+	pos := 0
+	inFence := false
+	fenceStart := -1
+	inParagraph := false
+	paragraphStart := -1
+
+	for pos < n {
+		lineEnd := strings.IndexByte(text[pos:], '\n')
+		if lineEnd >= 0 {
+			lineEnd += pos
+		} else {
+			lineEnd = n
+		}
+		lineEndWithNL := lineEnd
+		if lineEnd < n && text[lineEnd] == '\n' {
+			lineEndWithNL = lineEnd + 1
+		}
+		line := text[pos:lineEnd]
+		trimmed := trimRightKeepLeft(line)
+
+		if !inFence && codeFencePattern.MatchString(trimmed) {
+			// 进入代码块前先结束当前段落，避免正文和代码被合并进同一结构块。
+			if inParagraph {
+				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
+				inParagraph = false
+			}
+			inFence = true
+			fenceStart = pos
+			pos = lineEndWithNL
+			continue
+		}
+		if inFence {
+			if codeFencePattern.MatchString(trimmed) {
+				// 围栏代码块整体作为 blockCode，避免分块时拆开代码上下文。
+				blocks = append(blocks, structureBlock{kind: blockCode, start: fenceStart, end: lineEndWithNL})
+				inFence = false
+			}
+			pos = lineEndWithNL
+			continue
+		}
+		if strings.TrimSpace(trimmed) == "" {
+			if inParagraph {
+				// 空行是段落边界，段落块到此结束。
+				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
+				inParagraph = false
+			}
+			pos = lineEndWithNL
+			continue
+		}
+		if headingPattern.MatchString(trimmed) {
+			if inParagraph {
+				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
+				inParagraph = false
+			}
+			// 标题单独成块，后续打包时可以和紧随内容合并，但不会被误判为普通段落。
+			blocks = append(blocks, structureBlock{kind: blockHeading, start: pos, end: lineEndWithNL})
+			pos = lineEndWithNL
+			continue
+		}
+		if atomicImagePattern.MatchString(trimmed) || atomicLinkPattern.MatchString(trimmed) {
+			if inParagraph {
+				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
+				inParagraph = false
+			}
+			// 图片/单独链接作为原子块，避免拆分 Markdown 语法。
+			blocks = append(blocks, structureBlock{kind: blockAtomic, start: pos, end: lineEndWithNL})
+			pos = lineEndWithNL
+			continue
+		}
+		if !inParagraph {
+			inParagraph = true
+			paragraphStart = pos
+		}
+		pos = lineEndWithNL
+	}
+
+	if inFence {
+		blocks = append(blocks, structureBlock{kind: blockCode, start: fenceStart, end: n})
+	} else if inParagraph {
+		blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: n})
+	}
+	return blocks
+}
+
+// packStructureAwareBlocks 把结构块合并为 chunk 范围。
+// 合并目标是接近 targetChars，同时不超过 maxChars；如果当前 chunk 太短，会继续吸收
+// 后续块，最后一个很短的 chunk 会尝试合并回前一个。
+func packStructureAwareBlocks(blocks []structureBlock, minChars, targetChars, maxChars int) [][2]int {
+	if targetChars <= 0 {
+		targetChars = 1400
+	}
+	if maxChars <= 0 {
+		maxChars = 1800
+	}
+	if minChars <= 0 {
+		minChars = 600
+	}
+	ranges := make([][2]int, 0)
+	// 贪婪合并：从第 i 个结构块起，不断并入下一块，直到「再并会超 max」且已够长；过短则宁愿超一点 max 也要并满 min/target
+	for i := 0; i < len(blocks); {
+		chunkStart := blocks[i].start
+		chunkEnd := blocks[i].end
+		size := chunkEnd - chunkStart
+		j := i + 1
+		for j < len(blocks) {
+			next := blocks[j]
+			afterAdd := next.end - chunkStart
+			if afterAdd <= maxChars || size < minChars || size < targetChars {
+				chunkEnd = next.end
+				size = afterAdd
+				j++
+				if size >= targetChars && size >= minChars {
+					break // 达到目标体积可提前收手，减少把下一大段挤进同一块
+				}
+				continue
+			}
+			break
+		}
+		ranges = append(ranges, [2]int{chunkStart, chunkEnd})
+		i = j
+	}
+	// 尾块过短（常见：文档末尾余数）则并回前一块，避免检索时大量无意义短 chunk；maxChars*2 是简单上界防暴长
+	if len(ranges) >= 2 {
+		last := ranges[len(ranges)-1]
+		if last[1]-last[0] < minInt(minChars, targetChars/2) {
+			prev := &ranges[len(ranges)-2]
+			if last[1]-prev[0] <= maxChars*2 {
+				prev[1] = last[1]
+				ranges = ranges[:len(ranges)-1]
+			}
+		}
+	}
+	return ranges
+}
+
+// materializeStructureAware 根据范围切出最终文本，并可把上一块尾部作为 overlap。
+func materializeStructureAware(text string, ranges [][2]int, overlapChars int) []string {
+	if len(ranges) == 0 {
+		return nil
+	}
+	chunks := make([]string, 0, len(ranges))
+	prevTail := ""
+	for _, rg := range ranges {
+		body := text[rg[0]:rg[1]]
+		if overlapChars > 0 && prevTail != "" {
+			body = prevTail + body // 纯文本拼接：把上一块**原文**尾部叠到下一块头，不是向量意义 overlap
+		}
+		body = strings.TrimSpace(body)
+		if body != "" {
+			chunks = append(chunks, body)
+		}
+		if overlapChars > 0 {
+			prevTail = tailByRunes(text[rg[0]:rg[1]], overlapChars) // 从**当前块原文**取尾，非扩写后 body
+		}
+	}
+	return chunks
 }
 
 // normalizeChunkText 做分块前的轻量文本规整。
@@ -183,7 +359,7 @@ func adjustFixedBoundary(runes []rune, start, targetEnd, overlap int) int {
 	if targetEnd <= start {
 		return targetEnd
 	}
-	maxLookback := min(overlap, targetEnd-start)
+	maxLookback := minInt(overlap, targetEnd-start)
 	if maxLookback <= 0 {
 		return targetEnd
 	}
@@ -222,142 +398,29 @@ func adjustFixedBoundary(runes []rune, start, targetEnd, overlap int) int {
 	return targetEnd
 }
 
+// trimRightKeepLeft 去掉行尾空白但保留行首缩进，避免代码块/列表缩进丢失。
+func trimRightKeepLeft(s string) string {
+	return strings.TrimRightFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) && r != '\n' && r != '\r'
+	})
+}
+
+// tailByRunes 按 rune 截取尾部 overlap，避免中文等多字节字符被截断。
+func tailByRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[len(runes)-n:])
+}
+
 // looksLikeURLStart 判断当前位置是否像 URL 起点。
 func looksLikeURLStart(s string, i int) bool {
 	rest := strings.ToLower(s[i:])
 	return strings.HasPrefix(rest, "http://") || strings.HasPrefix(rest, "https://") || strings.HasPrefix(rest, "www.")
-}
-
-func isASCIIAlpha(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
-}
-
-func isURLChar(b byte) bool {
-	return isASCIIAlpha(b) || (b >= '0' && b <= '9')
-}
-
-func isCommonURLPunct(b byte) bool {
-	switch b {
-	case '.', '/', ':', '?', '&', '=', '#', '%', '-', '_', '~':
-		return true
-	default:
-		return false
-	}
-}
-
-func isCJKWordChar(r rune) bool {
-	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r)
-}
-
-type structureBlockKind int
-
-const (
-	blockHeading structureBlockKind = iota
-	blockCode
-	blockAtomic
-	blockParagraph
-)
-
-type structureBlock struct {
-	kind  structureBlockKind
-	start int
-	end   int
-}
-
-var (
-	headingPattern     = regexp.MustCompile(`^#{1,6}\s+.*$`)
-	codeFencePattern   = regexp.MustCompile("^```.*$")
-	atomicImagePattern = regexp.MustCompile(`^!\[[^]]*]\([^)]+\)(?:\s*"[^"]*")?\s*$`)
-	atomicLinkPattern  = regexp.MustCompile(`^\[[^]]+]\([^)]+\)\s*$`)
-)
-
-// segmentStructureAwareBlocks 扫描文本并产出结构块范围。
-// 它识别标题、围栏代码块、图片/链接原子块和普通段落，返回的是原文 byte 区间，
-// 这样后续 materialize 时可以保留原始内容格式。
-func segmentStructureAwareBlocks(text string) []structureBlock {
-	blocks := make([]structureBlock, 0)
-	n := len(text)
-	pos := 0
-	inFence := false
-	fenceStart := -1
-	inParagraph := false
-	paragraphStart := -1
-
-	for pos < n {
-		lineEnd := strings.IndexByte(text[pos:], '\n')
-		if lineEnd >= 0 {
-			lineEnd += pos
-		} else {
-			lineEnd = n
-		}
-		lineEndWithNL := lineEnd
-		if lineEnd < n && text[lineEnd] == '\n' {
-			lineEndWithNL++
-		}
-		line := text[pos:lineEnd]
-		trimmed := trimRightKeepLeft(line)
-
-		if !inFence && codeFencePattern.MatchString(trimmed) {
-			// 进入代码块前先结束当前段落，避免正文和代码被合并进同一结构块。
-			if inParagraph {
-				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
-				inParagraph = false
-			}
-			inFence = true
-			fenceStart = pos
-			pos = lineEndWithNL
-			continue
-		}
-		if inFence {
-			if codeFencePattern.MatchString(trimmed) {
-				// 围栏代码块整体作为 blockCode，避免分块时拆开代码上下文。
-				blocks = append(blocks, structureBlock{kind: blockCode, start: fenceStart, end: lineEndWithNL})
-				inFence = false
-			}
-			pos = lineEndWithNL
-			continue
-		}
-		if strings.TrimSpace(trimmed) == "" {
-			if inParagraph {
-				// 空行是段落边界，段落块到此结束。
-				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
-				inParagraph = false
-			}
-			pos = lineEndWithNL
-			continue
-		}
-		if headingPattern.MatchString(trimmed) {
-			if inParagraph {
-				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
-				inParagraph = false
-			}
-			// 标题单独成块，后续打包时可以和紧随内容合并，但不会被误判为普通段落。
-			blocks = append(blocks, structureBlock{kind: blockHeading, start: pos, end: lineEndWithNL})
-			pos = lineEndWithNL
-			continue
-		}
-		if atomicImagePattern.MatchString(trimmed) || atomicLinkPattern.MatchString(trimmed) {
-			if inParagraph {
-				blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: pos})
-				inParagraph = false
-			}
-			// 图片/单独链接作为原子块，避免拆分 Markdown 语法。
-			blocks = append(blocks, structureBlock{kind: blockAtomic, start: pos, end: lineEndWithNL})
-			pos = lineEndWithNL
-			continue
-		}
-		if !inParagraph {
-			inParagraph = true
-			paragraphStart = pos
-		}
-		pos = lineEndWithNL
-	}
-	if inFence {
-		blocks = append(blocks, structureBlock{kind: blockCode, start: fenceStart, end: n})
-	} else if inParagraph {
-		blocks = append(blocks, structureBlock{kind: blockParagraph, start: paragraphStart, end: n})
-	}
-	return blocks
 }
 
 // shouldJoinBrokenURL 判断 URL 中间的换行是否应该被吞掉。
@@ -394,93 +457,37 @@ func isListItemStart(s string, i int) bool {
 	return digits > 0 && p < len(s) && s[p] == '.'
 }
 
-// trimRightKeepLeft 去掉行尾空白但保留行首缩进，避免代码块/列表缩进丢失。
-func trimRightKeepLeft(s string) string {
-	return strings.TrimRightFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r) && r != '\n' && r != '\r'
-	})
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// packStructureAwareBlocks 把结构块合并为 chunk 范围。
-// 合并目标是接近 targetChars，同时不超过 maxChars；如果当前 chunk 太短，会继续吸收
-// 后续块，最后一个很短的 chunk 会尝试合并回前一个。
-func packStructureAwareBlocks(blocks []structureBlock, minChars, targetChars, maxChars int) [][2]int {
-	if targetChars <= 0 {
-		targetChars = 1400
-	}
-	if maxChars <= 0 {
-		maxChars = 1800
-	}
-	if minChars <= 0 {
-		minChars = 600
-	}
-	ranges := make([][2]int, 0)
-	for i := 0; i < len(blocks); {
-		chunkStart := blocks[i].start
-		chunkEnd := blocks[i].end
-		size := chunkEnd - chunkStart
-		j := i + 1
-		for j < len(blocks) {
-			next := blocks[j]
-			afterAdd := next.end - chunkStart
-			if afterAdd <= maxChars || size < minChars || size < targetChars {
-				chunkEnd = next.end
-				size = afterAdd
-				j++
-				if size >= targetChars && size >= minChars {
-					break
-				}
-				continue
-			}
-			break
-		}
-		ranges = append(ranges, [2]int{chunkStart, chunkEnd})
-		i = j
-	}
-	if len(ranges) >= 2 {
-		last := ranges[len(ranges)-1]
-		if last[1]-last[0] < min(minChars, targetChars/2) {
-			prev := &ranges[len(ranges)-2]
-			if last[1]-prev[0] <= maxChars*2 {
-				prev[1] = last[1]
-				ranges = ranges[:len(ranges)-1]
-			}
-		}
-	}
-	return ranges
+func isURLChar(b byte) bool {
+	return isASCIIAlpha(b) || (b >= '0' && b <= '9')
 }
 
-// materializeStructureAware 根据范围切出最终文本，并可把上一块尾部作为 overlap。
-func materializeStructureAware(text string, ranges [][2]int, overlapChars int) []string {
-	if len(ranges) == 0 {
-		return nil
+func isCommonURLPunct(b byte) bool {
+	switch b {
+	case '.', '/', ':', '?', '&', '=', '#', '%', '-', '_', '~':
+		return true
+	default:
+		return false
 	}
-	chunks := make([]string, 0, len(ranges))
-	prevTail := ""
-	for _, rg := range ranges {
-		body := text[rg[0]:rg[1]]
-		if overlapChars > 0 && prevTail != "" {
-			body = prevTail + body
-		}
-		body = strings.TrimSpace(body)
-		if body != "" {
-			chunks = append(chunks, body)
-		}
-		if overlapChars > 0 {
-			prevTail = tailByRunes(text[rg[0]:rg[1]], overlapChars)
-		}
-	}
-	return chunks
 }
 
-// tailByRunes 按 rune 截取尾部 overlap，避免中文等多字节字符被截断。
-func tailByRunes(s string, n int) string {
-	if n <= 0 {
-		return ""
+func isCJKWordChar(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
 	}
-	return string(runes[len(runes)-n:])
+	return b
 }

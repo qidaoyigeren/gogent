@@ -19,6 +19,16 @@ type RoutingRerankService struct {
 	clients  map[string]RerankClient                // 提供商 -> 客户端映射
 }
 
+// NewRoutingRerankService 创建路由 Rerank 服务
+// 参数：
+//   - aiCfg: AI 配置，包含所有候选模型
+//   - health: 健康状态存储，用于熔断器
+//   - selector: 模型选择器，负责候选过滤
+//
+// 工作流程：
+// 1. 创建提供商客户端映射（bailian、noop）
+// 2. 创建路由执行器
+// 3. 返回配置好的路由服务实例
 func NewRoutingRerankService(aiCfg config.AIConfig, health *model.HealthStore, selector *model.Selector) *RoutingRerankService {
 	// 初始化提供商客户端映射
 	clients := map[string]RerankClient{
@@ -36,6 +46,19 @@ func NewRoutingRerankService(aiCfg config.AIConfig, health *model.HealthStore, s
 
 // Rerank 对文档列表进行重排序（使用默认路由）
 // 自动选择健康且可用的模型
+//
+// 工作流程：
+//  1. 调用 executor.Execute，传入默认 rerank 配置
+//  2. Executor 内部：
+//     a. 通过 selector 选择可用候选（过滤熔断的模型）
+//     b. 按优先级遍历候选
+//     c. 对每个候选调用下方的回调函数
+//     d. 失败则记录 health，尝试下一个
+//     e. 成功则返回结果
+//  3. 回调函数：
+//     a. 根据 target.Provider 查找对应的客户端
+//     b. 调用客户端的 Rerank 方法
+//     c. 返回排序后的结果
 func (s *RoutingRerankService) Rerank(ctx context.Context, query string, documents []string, topN int) ([]RerankResult, error) {
 	return s.executor.Execute(ctx, s.aiCfg.Rerank, "rerank", func(ctx context.Context, target model.ModelTarget) ([]RerankResult, error) {
 		// 根据提供商名称查找对应的客户端

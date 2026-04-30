@@ -2,6 +2,7 @@ package service
 
 import (
 	"gogent/internal/entity"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -20,6 +21,8 @@ func NewConversationGroupService(db *gorm.DB) *ConversationGroupService {
 }
 
 // ListLatestUserOnlyMessages 返回指定会话最新 limit 条 user 消息，按 create_time DESC 排序。
+// 为什么只取 user：部分场景（问题重写、摘要、引导）只需要用户侧历史文本作为上下文种子。
+// 参数校验：空 ID / limit<=0 都返回空切片，不抛错。
 func (s *ConversationGroupService) ListLatestUserOnlyMessages(conversationID, userID string, limit int) []entity.ConversationMessageDO {
 	if conversationID == "" || userID == "" || limit <= 0 {
 		return []entity.ConversationMessageDO{}
@@ -38,23 +41,47 @@ func (s *ConversationGroupService) ListLatestUserOnlyMessages(conversationID, us
 
 // ListMessagesBetweenIds 返回 (afterID, beforeID) 之间的消息（不含端点），只保留 user + assistant。
 // 典型用途：memory 摘要恢复时，取上次摘要到“当前最大消息 ID”的增量片段继续汇总。
+// 排序：id ASC（雪花 ID 随时间单调递增，等价于 create_time ASC 但更稳定）。
 func (s *ConversationGroupService) ListMessagesBetweenIds(conversationID, userID, afterID, beforeID string) []entity.ConversationMessageDO {
 	if conversationID == "" || userID == "" {
 		return []entity.ConversationMessageDO{}
 	}
 
-	query := s.db.Where("conversation_id = ? AND user_id = ? AND deleted = 0 AND role IN (?)",
+	query := s.db.Where("conversation_id = ? AND user_id = ? AND role IN ? AND deleted = 0",
 		conversationID, userID, []string{"user", "assistant"})
+
+	// 任一边界为空则不加条件（开区间端点可选）
 	if afterID != "" {
 		query = query.Where("id > ?", afterID)
 	}
 	if beforeID != "" {
 		query = query.Where("id < ?", beforeID)
 	}
+
 	var messages []entity.ConversationMessageDO
 	query.Order("id ASC").Find(&messages)
 
 	return messages
+}
+
+// FindMaxMessageIdAtOrBefore 找出 at 时刻及之前、该会话的最大消息 ID。
+// 用于摘要记忆：记录“摘要覆盖到 messageID X”，后续只需读取 (X, 当前] 之间的增量。
+// 返回空串表示未找到（空会话或 at 早于所有消息）。
+func (s *ConversationGroupService) FindMaxMessageIdAtOrBefore(conversationID, userID string, at time.Time) string {
+	if conversationID == "" || userID == "" || at.IsZero() {
+		return ""
+	}
+
+	var msg entity.ConversationMessageDO
+	err := s.db.Where("conversation_id = ? AND user_id = ? AND deleted = 0 AND create_time <= ?",
+		conversationID, userID, at).
+		Order("id DESC"). // ID 单调递增，取 DESC 首条即最大
+		First(&msg).Error
+
+	if err != nil {
+		return ""
+	}
+	return msg.ID
 }
 
 // CountUserMessages 统计会话内 user 消息数量。

@@ -60,22 +60,26 @@ func NewScheduleLockManager(rdb *redis.Client, db *gorm.DB, lockSeconds int64) *
 
 // TryAcquire attempts to acquire a lock for a schedule.
 // Returns nil if lock cannot be acquired.
-// 分布式锁采用“双层保护”：Redis SetNX 用于跨实例快速互斥，数据库 lock_until 用于
+// 分布式锁采用"双层保护"：Redis SetNX 用于跨实例快速互斥，数据库 lock_until 用于
 // 可见性和 Redis 不可用时的兜底。只有两层都成功，才认为本实例拿到执行权。
 func (m *ScheduleLockManager) TryAcquire(ctx context.Context, scheduleID string, now time.Time) *ScheduleLockLease {
 	lockKey := fmt.Sprintf("schedule:lock:%s", scheduleID)
 	lockID := fmt.Sprintf("lock:%d", now.UnixNano())
 	lockUntil := now.Add(time.Duration(m.lockSeconds) * time.Second)
 
+	// Try Redis lock first (distributed)
 	if m.rdb != nil {
 		acquired, err := m.rdb.SetNX(ctx, lockKey, lockID, time.Duration(m.lockSeconds)*time.Second).Result()
 		if err != nil {
 			slog.Warn("redis lock failed", "scheduleID", scheduleID, "err", err)
+			// Fall back to DB lock
 		} else if !acquired {
 			return nil
 		}
 	}
 
+	// Also update database lock (for visibility and fallback)
+	// 条件中的 lock_until < now 保证过期锁可被新实例接管。
 	result := m.db.Exec(`
 		UPDATE t_knowledge_document_schedule 
 		SET lock_until = ?, update_time = NOW()
@@ -148,10 +152,14 @@ func (m *ScheduleLockManager) Release(ctx context.Context, lease *ScheduleLockLe
 	slog.Debug("schedule lock released", "scheduleID", lease.ScheduleID)
 }
 
+// run runs the heartbeat loop.
 func (hb *ScheduleLockHeartbeat) run() {
-	internal := time.Duration(hb.lockMgr.lockSeconds/2) * time.Second
-	ticker := time.NewTicker(internal)
+	// Heartbeat every half of lock duration
+	// 使用半个租约周期续期，给网络抖动和数据库延迟留出余量。
+	interval := time.Duration(hb.lockMgr.lockSeconds/2) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
@@ -180,8 +188,9 @@ func (hb *ScheduleLockHeartbeat) renew() bool {
 	lockKey := fmt.Sprintf("schedule:lock:%s", hb.lease.ScheduleID)
 	lockTTLms := hb.lockMgr.lockSeconds * 1000
 
+	// 1. Redis：Lua 原子校验 lockID + 延长 TTL
 	if hb.lockMgr.rdb != nil {
-		result, err := renewLockLua.Run(hb.ctx, hb.lockMgr.rdb, []string{lockKey}, hb.lease.LockID, lockTTLms).Result()
+		result, err := renewLockLua.Run(hb.ctx, hb.lockMgr.rdb, []string{lockKey}, hb.lease.LockID, lockTTLms).Int64()
 		if err != nil || result == 0 {
 			slog.Warn("heartbeat redis renewal failed, releasing lock",
 				"scheduleID", hb.lease.ScheduleID, "err", err)
@@ -194,7 +203,8 @@ func (hb *ScheduleLockHeartbeat) renew() bool {
 			return false
 		}
 	}
-	//DB续期lock_until
+
+	// 2. DB：续期 lock_until（条件保证过期锁不被续）
 	result := hb.lockMgr.db.Exec(`
 		UPDATE t_knowledge_document_schedule
 		SET lock_until = ?, update_time = NOW()

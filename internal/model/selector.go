@@ -13,14 +13,13 @@ type Selector struct {
 
 // NewSelector creates a model selector.
 func NewSelector(health *HealthStore) *Selector {
-	return &Selector{
-		health: health,
-	}
+	return &Selector{health: health}
 }
 
 // Select returns available candidates sorted by priority (ascending), filtered by circuit breaker.
 func (s *Selector) Select(group config.ModelGroupConfig) []config.ModelCandidate {
 	var available []config.ModelCandidate
+
 	for _, c := range group.Candidates {
 		if !c.IsEnabled() {
 			continue
@@ -31,9 +30,11 @@ func (s *Selector) Select(group config.ModelGroupConfig) []config.ModelCandidate
 		}
 		available = append(available, c)
 	}
+
 	sort.Slice(available, func(i, j int) bool {
 		return available[i].Priority < available[j].Priority
 	})
+
 	return available
 }
 
@@ -58,4 +59,22 @@ func (s *Selector) SelectChatCandidates(group config.ModelGroupConfig, deepThink
 		}
 	}
 	return preferredID, filtered
+}
+
+// SelectDefault returns the default model candidate. Falls back to first available.
+func (s *Selector) SelectDefault(group config.ModelGroupConfig) (config.ModelCandidate, bool) {
+	candidates := s.Select(group)
+	if len(candidates) == 0 {
+		return config.ModelCandidate{}, false
+	}
+
+	// Try to find the configured default
+	for _, c := range candidates {
+		if c.ID == group.DefaultModel {
+			return c, true
+		}
+	}
+
+	// Fallback to highest priority
+	return candidates[0], true
 }

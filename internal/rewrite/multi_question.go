@@ -28,6 +28,13 @@ func NewMultiQuestionRewriteService(llm chat.LLMService, termMapper *TermMapper,
 	}
 }
 
+// systemPrompt LLM 系统提示词
+// 核心规则：
+// 1. 保留专有名词（系统名、产品名、模块名）
+// 2. 保留关键限制（时间范围、环境、终端类型、角色身份）
+// 3. 删除礼貌用语和无关回答指令
+// 4. 补全指代词（结合历史消息）
+// 5. 只在多个问号、显式列举、分号/换行时才拆分
 const systemPrompt = `# 角色
 你是查询改写助手，用于 RAG 检索阶段。
 
@@ -56,19 +63,30 @@ const systemPrompt = `# 角色
 - 问候/身份类问题保持原样`
 
 // Rewrite 改写单个查询（不返回子问题）
+// 降级策略：
+// 1. 始终先应用术语映射（免费、快速）
+// 2. 如果配置禁用 LLM → 术语映射 + 规则拆分
+// 3. 如果 LLM 失败 → 术语映射结果
 func (s *MultiQuestionRewriteService) Rewrite(ctx context.Context, query string, history []chat.Message) (*RewriteResult, error) {
 	result, err := s.rewriteAndSplit(ctx, query, history)
 	if err != nil {
 		return nil, err
 	}
+	// 剥离子问题 — 调用方只需要改写后的查询
 	return &RewriteResult{Rewritten: result.Rewritten}, nil
 }
 
 // RewriteMulti 改写查询并拆分子问题（单次 LLM 调用）
+// 对齐 Java 的 callLLMRewriteAndSplit
+// 降级策略：
+// 1. 如果 cfg.Enabled = false → 不调用 LLM，仅术语映射 + 规则拆分
+// 2. 如果 LLM 失败 → 术语映射结果
+// 3. 如果 JSON 解析失败 → 术语映射结果
 func (s *MultiQuestionRewriteService) RewriteMulti(ctx context.Context, query string, history []chat.Message) (*RewriteResult, error) {
 	return s.rewriteAndSplit(ctx, query, history)
 }
 
+// rewriteAndSplit 核心实现（Rewrite 和 RewriteMulti 共享）
 // 工作流程：
 // 1. 术语映射（始终执行，免费）
 // 2. 检查配置是否启用 LLM
@@ -79,7 +97,8 @@ func (s *MultiQuestionRewriteService) RewriteMulti(ctx context.Context, query st
 func (s *MultiQuestionRewriteService) rewriteAndSplit(ctx context.Context, query string, history []chat.Message) (*RewriteResult, error) {
 	// 始终先应用术语映射（基于规则，无成本）
 	normalized := s.termMapper.Normalize(query)
-	// 当查询改写被禁用时，跳过 LLM
+
+	// 当查询改写被禁用时，跳过 LLM — 对齐 Java 的短路逻辑
 	// 直接返回术语映射结果 + 基于规则的拆分
 	if !s.cfg.Enabled {
 		return &RewriteResult{
@@ -87,13 +106,14 @@ func (s *MultiQuestionRewriteService) rewriteAndSplit(ctx context.Context, query
 			SubQuestions: ruleBasedSplit(normalized),
 		}, nil
 	}
+
 	// 构建消息：系统提示 + 最近 4 轮历史 + 当前查询
 	// 历史裁剪策略：保留最近 4 轮（8 条消息），避免上下文过长
 	messages := []chat.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 	if len(history) > 0 {
-		start := len(history) - 4
+		start := len(history) - 4 // 从倒数第 4 轮开始
 		if start < 0 {
 			start = 0
 		}
@@ -104,18 +124,21 @@ func (s *MultiQuestionRewriteService) rewriteAndSplit(ctx context.Context, query
 		}
 	}
 	messages = append(messages, chat.Message{Role: "user", Content: normalized})
+
 	// 调用 LLM（低温度保证输出稳定）
 	resp, err := s.llm.Chat(ctx, messages,
-		chat.WithTemperature(0.1),
-		chat.WithTopP(0.3),
+		chat.WithTemperature(0.1), // 低温度：改写任务需要确定性
+		chat.WithTopP(0.3),        // 低 top_p：集中在高概率 token
 	)
 	if err != nil {
+		// LLM 调用失败 → 降级为术语映射结果
 		slog.Warn("rewrite LLM call failed, using normalised query", "err", err)
 		return &RewriteResult{
 			Rewritten:    normalized,
 			SubQuestions: []string{normalized},
 		}, nil
 	}
+
 	// 提取思考内容（支持 DeepThinking 模型）
 	content := llmutil.ExtractThinkContent(resp.Content)
 	type llmResult struct {
@@ -131,13 +154,16 @@ func (s *MultiQuestionRewriteService) rewriteAndSplit(ctx context.Context, query
 			SubQuestions: []string{normalized},
 		}, nil
 	}
+
 	// 处理子问题：如果 LLM 未返回子问题，使用改写结果作为唯一子问题
 	subs := parsed.SubQuestions
 	if len(subs) == 0 {
 		subs = []string{parsed.Rewrite}
 	}
+
 	slog.Debug("query rewrite", "original", query, "normalised", normalized,
 		"rewritten", parsed.Rewrite, "subQuestions", subs)
+
 	return &RewriteResult{
 		Rewritten:    parsed.Rewrite, // LLM 改写结果
 		SubQuestions: subs,           // 子问题列表
@@ -159,8 +185,8 @@ func ruleBasedSplit(question string) []string {
 		if p == "" {
 			continue
 		}
-		if !strings.HasSuffix(p, "?") && !strings.HasSuffix(p, "？") {
-			p += "?"
+		if !strings.HasSuffix(p, "？") && !strings.HasSuffix(p, "?") {
+			p += "？"
 		}
 		result = append(result, p)
 	}

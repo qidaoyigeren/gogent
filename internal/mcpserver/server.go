@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// JSONRPCRequest JSON-RPC 2.0 请求结构体
 type JSONRPCRequest struct {
 	JSONRPC string                 `json:"jsonrpc"`          // 协议版本（固定 "2.0"）
 	ID      interface{}            `json:"id,omitempty"`     // 请求 ID（通知为 nil）
@@ -93,6 +92,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 }
 
 // dispatch 分发 JSON-RPC 请求到对应处理方法
+// 支持的方法：
+// - initialize: 初始化连接
+// - tools/list: 获取工具列表
+// - tools/call: 调用工具
 func (s *Server) dispatch(req *JSONRPCRequest) JSONRPCResponse {
 	switch req.Method {
 	case "initialize":
