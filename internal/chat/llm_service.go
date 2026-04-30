@@ -6,12 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"gogent/internal/model"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"gogent/internal/model"
 )
 
 // Message represents a chat message (role + content).
@@ -164,6 +165,7 @@ func (c *openAIClient) call(ctx context.Context, target model.ModelTarget, req C
 	if target.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+target.APIKey)
 	}
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http call: %w", err)
@@ -194,8 +196,8 @@ func (c *openAIClient) call(ctx context.Context, target model.ModelTarget, req C
 }
 
 func (c *openAIClient) callStream(ctx context.Context, target model.ModelTarget, req ChatRequest) (<-chan StreamDelta, error) {
-	// 1. 发送 HTTP 请求（Accept: text/event-stream）
 	apiReq := c.buildAPIRequest(target, req, true)
+
 	body, _ := json.Marshal(apiReq)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target.URL, bytes.NewReader(body))
 	if err != nil {
@@ -211,18 +213,19 @@ func (c *openAIClient) callStream(ctx context.Context, target model.ModelTarget,
 	if err != nil {
 		return nil, fmt.Errorf("http call: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		return nil, fmt.Errorf("LLM returned %d: %s", resp.StatusCode, string(respBody))
 	}
-	// 2. 创建两个 channel
+
+	// Reader + consumer so we can exit promptly when ctx is canceled (stop button / client disconnect).
 	type rawLine struct {
 		s   string
 		err error
 	}
 	lineCh := make(chan rawLine, 128)
-	// 3. Goroutine 1：读取 SSE 流
 	go func() {
 		defer close(lineCh)
 		scanner := bufio.NewScanner(resp.Body)
@@ -240,7 +243,7 @@ func (c *openAIClient) callStream(ctx context.Context, target model.ModelTarget,
 			}
 		}
 	}()
-	// 4. Goroutine 2：解析 SSE 数据
+
 	ch := make(chan StreamDelta, 64)
 	go func() {
 		defer close(ch)
@@ -268,6 +271,7 @@ func (c *openAIClient) callStream(ctx context.Context, target model.ModelTarget,
 				if data == "[DONE]" {
 					return
 				}
+
 				var chunk openAIResponse
 				if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 					ch <- StreamDelta{Err: err}
@@ -294,6 +298,7 @@ func (c *openAIClient) callStream(ctx context.Context, target model.ModelTarget,
 			}
 		}
 	}()
+
 	return ch, nil
 }
 

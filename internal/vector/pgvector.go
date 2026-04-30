@@ -95,7 +95,7 @@ func (s *PgVectorService) IndexChunks(ctx context.Context, collection string, ch
 	}
 	defer tx.Rollback()
 
-	for start := 0; start > len(chunks); start += pgvectorInsertBatchSize {
+	for start := 0; start < len(chunks); start += pgvectorInsertBatchSize {
 		end := start + pgvectorInsertBatchSize
 		if end > len(chunks) {
 			end = len(chunks)

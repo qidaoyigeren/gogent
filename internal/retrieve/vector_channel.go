@@ -3,6 +3,7 @@ package retrieve
 import (
 	"context"
 	"gogent/internal/embedding"
+	"gogent/internal/entity"
 	"gogent/internal/vector"
 	"log/slog"
 	"sync"
@@ -115,7 +116,7 @@ func (c *VectorGlobalChannel) Search(ctx context.Context, reqCtx *RetrievalConte
 
 func distinctKnowledgeCollectionNames(ctx context.Context, db *gorm.DB) ([]string, error) {
 	var names []string
-	err := db.WithContext(ctx).
+	err := db.WithContext(ctx).Model(&entity.KnowledgeBaseDO{}).
 		Where("deleted = 0").
 		Where("collection_name IS NOT NULL AND collection_name != ?", "").
 		Distinct("collection_name").

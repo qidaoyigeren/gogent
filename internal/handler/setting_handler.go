@@ -21,9 +21,10 @@ func (h *SettingsHandler) RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 // getSettings 聚合运行时配置给前端。
-// 注意：API Key 等敏感字段当前也随 providers 返回（但生产需要评估是否脱敏）。
+// 注意：API Key 等敏感字段当前也随 providers 返回（对齐 Java，但生产需要评估是否脱敏）。
 func (h *SettingsHandler) getSettings(c *gin.Context) {
 	response.Success(c, gin.H{
+		// 上传段：保留 Java 默认值，前端据此做客户端侧预校验
 		"upload": gin.H{
 			"maxFileSize":    50 * 1024 * 1024, // 单文件 50MB
 			"maxRequestSize": 104857600,        // 整请求 100MB

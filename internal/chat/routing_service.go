@@ -10,73 +10,38 @@ import (
 	"time"
 )
 
-// RoutingLLMService routes chat requests through the model routing layer.
+// RoutingLLMService 是带路由功能的 LLM 服务
+// 核心职责：
+// 1. 多模型候选：配置多个模型（如 qwen-plus → glm-4 → 本地模型）
+// 2. 自动降级：当主模型失败时，自动尝试备用模型
+// 3. 健康检查：记录模型成功/失败次数，实现熔断机制
+// 4. 首包探测：流式响应先等待第一个数据包，确认模型正常后再返回
 type RoutingLLMService struct {
-	chatExecutor   *model.RoutingExecutor[*ChatResponse]
-	streamExecutor *model.RoutingExecutor[<-chan StreamDelta]
-	aiCfg          config.AIConfig
-	openAI         *openAIClient
-	ollama         *ollamaClient
-	selector       *model.Selector
-	health         *model.HealthStore
+	chatExecutor   *model.RoutingExecutor[*ChatResponse]      // 非流式请求的路由执行器
+	streamExecutor *model.RoutingExecutor[<-chan StreamDelta] // 流式请求的路由执行器
+	aiCfg          config.AIConfig                            // AI 配置（包含所有模型提供商信息）
+	openAI         *openAIClient                              // OpenAI 兼容 API 客户端（百炼、硅基流动）
+	ollama         *ollamaClient                              // Ollama 本地模型客户端
+	selector       *model.Selector                            // 模型选择器（根据是否深度思考选择候选列表）
+	health         *model.HealthStore                         // 健康状态存储（记录模型成功/失败次数）
 }
 
-// NewRoutingLLMService creates a new routing LLM service.
+// NewRoutingLLMService 创建带路由功能的 LLM 服务实例
+// 参数说明：
+//   - aiCfg: AI 配置，包含所有模型提供商的 URL、API Key 等
+//   - health: 健康状态存储，用于记录模型的成功/失败次数
+//   - selector: 模型选择器，根据配置选择合适的候选模型
 func NewRoutingLLMService(aiCfg config.AIConfig, health *model.HealthStore, selector *model.Selector) *RoutingLLMService {
 	return &RoutingLLMService{
+		// 创建两个路由执行器：一个用于非流式，一个用于流式
+		// RoutingExecutor 负责：按优先级尝试候选模型、记录健康状态、自动降级
 		chatExecutor:   model.NewRoutingExecutor[*ChatResponse](selector, health, aiCfg.Providers),
 		streamExecutor: model.NewRoutingExecutor[<-chan StreamDelta](selector, health, aiCfg.Providers),
 		aiCfg:          aiCfg,
-		openAI:         newOpenAIClient(),
-		ollama:         newOllamaClient(),
+		openAI:         newOpenAIClient(), // 初始化 OpenAI 兼容客户端（120s 超时）
+		ollama:         newOllamaClient(), // 初始化 Ollama 客户端（120s 超时）
 		selector:       selector,
 		health:         health,
-	}
-}
-
-func (s *RoutingLLMService) chatCandidates(thinking bool) (preferredID string, candidates []config.ModelCandidate) {
-	return s.selector.SelectChatCandidates(s.aiCfg.Chat, thinking)
-}
-
-func filterCandidatesByID(candidates []config.ModelCandidate, modelID string) []config.ModelCandidate {
-	if modelID == "" {
-		return candidates
-	}
-	filtered := make([]config.ModelCandidate, 0, 1)
-	for _, candidate := range candidates {
-		if candidate.ID == modelID {
-			filtered = append(filtered, candidate)
-		}
-	}
-	return filtered
-}
-
-func preferFirst(preferredID string, candidates []config.ModelCandidate) []config.ModelCandidate {
-	if preferredID == "" || len(candidates) <= 1 {
-		return candidates
-	}
-	var preferred *config.ModelCandidate
-	var rest []config.ModelCandidate
-	for _, c := range candidates {
-		if c.ID == preferredID && preferred == nil {
-			tmp := c
-			preferred = &tmp
-			continue
-		}
-		rest = append(rest, c)
-	}
-	if preferred == nil {
-		return candidates
-	}
-	return append([]config.ModelCandidate{*preferred}, rest...)
-}
-
-func (s *RoutingLLMService) callByProvider(ctx context.Context, target model.ModelTarget, req ChatRequest) (*ChatResponse, error) {
-	switch target.Provider {
-	case "ollama":
-		return s.ollama.call(ctx, target, req)
-	default:
-		return s.openAI.call(ctx, target, req)
 	}
 }
 
@@ -227,6 +192,58 @@ func (s *RoutingLLMService) ChatStream(ctx context.Context, messages []Message, 
 	return nil, errcode.NewRemoteError("所有模型候选均不可用", nil)
 }
 
+// ChatWithModelID 使用指定模型执行非流式聊天
+// 这是 Chat 的便捷方法，自动添加 modelID 选项
+func (s *RoutingLLMService) ChatWithModelID(ctx context.Context, modelID string, messages []Message, opts ...ChatOption) (*ChatResponse, error) {
+	opts = append(opts, WithModelID(modelID))
+	return s.Chat(ctx, messages, opts...)
+}
+
+// ChatStreamWithModelID 使用指定模型执行流式聊天
+// 这是 ChatStream 的便捷方法，自动添加 modelID 选项
+func (s *RoutingLLMService) ChatStreamWithModelID(ctx context.Context, modelID string, messages []Message, opts ...ChatOption) (<-chan StreamDelta, error) {
+	opts = append(opts, WithModelID(modelID))
+	return s.ChatStream(ctx, messages, opts...)
+}
+
+// callByProvider 根据提供商类型调用对应的客户端
+// 支持两种提供商：
+//   - ollama: 使用 Ollama 本地模型 API
+//   - 其他: 使用 OpenAI 兼容 API（百炼、硅基流动等）
+func (s *RoutingLLMService) callByProvider(ctx context.Context, target model.ModelTarget, req ChatRequest) (*ChatResponse, error) {
+	switch target.Provider {
+	case "ollama":
+		return s.ollama.call(ctx, target, req)
+	default:
+		return s.openAI.call(ctx, target, req)
+	}
+}
+
+// streamByProvider 根据提供商类型调用对应的流式客户端
+// 与 callByProvider 类似，但用于流式响应
+func (s *RoutingLLMService) streamByProvider(ctx context.Context, target model.ModelTarget, req ChatRequest) (<-chan StreamDelta, error) {
+	switch target.Provider {
+	case "ollama":
+		return s.ollama.callStream(ctx, target, req)
+	default:
+		return s.openAI.callStream(ctx, target, req)
+	}
+}
+
+// chatCandidates 根据是否开启深度思考选择合适的候选模型列表
+// 配置示例（config.yaml）：
+//
+//	ai.chat.candidates:
+//	  - id: qwen-plus       (priority: 1, 不支持 thinking)
+//	  - id: qwen3-max       (priority: 3, supports_thinking: true)
+//	  - id: glm-4.7         (priority: 0, supports_thinking: true)
+//
+// thinking=false 时：返回 [glm-4.7, qwen-plus, qwen3-max] 按 priority 升序
+// thinking=true 时：  返回 [glm-4.7, qwen3-max] 仅包含支持 thinking 的模型
+func (s *RoutingLLMService) chatCandidates(thinking bool) (preferredID string, candidates []config.ModelCandidate) {
+	return s.selector.SelectChatCandidates(s.aiCfg.Chat, thinking)
+}
+
 // resolveTarget 解析模型候选为具体的调用目标
 // 将配置信息合并：
 //   - candidate: 模型 ID、名称、优先级、是否支持 thinking
@@ -239,22 +256,72 @@ func (s *RoutingLLMService) ChatStream(ctx context.Context, messages []Message, 
 //   - URL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 //   - APIKey: "sk-xxx"
 func (s *RoutingLLMService) resolveTarget(c config.ModelCandidate, endpointKey string) (model.ModelTarget, bool) {
+	// 查找提供商配置
 	provider, ok := s.aiCfg.Providers[c.Provider]
 	if !ok {
 		return model.ModelTarget{}, false
 	}
+	// 合并配置，生成完整的调用目标
 	return model.ResolveTarget(c, provider, endpointKey), true
 }
 
-// streamByProvider 根据提供商类型调用对应的流式客户端
-// 与 callByProvider 类似，但用于流式响应
-func (s *RoutingLLMService) streamByProvider(ctx context.Context, target model.ModelTarget, req ChatRequest) (<-chan StreamDelta, error) {
-	switch target.Provider {
-	case "ollama":
-		return s.ollama.callStream(ctx, target, req)
-	default:
-		return s.openAI.callStream(ctx, target, req)
+// preferFirst 将首选模型移到候选列表第一位
+// 作用：确保用户指定的模型优先尝试
+//
+// 示例：
+//
+//	原列表: [A, B, C, D]
+//	首选: C
+//	结果: [C, A, B, D]
+//
+// 注意：保持其他元素的相对顺序不变
+func preferFirst(preferredID string, candidates []config.ModelCandidate) []config.ModelCandidate {
+	if preferredID == "" || len(candidates) <= 1 {
+		return candidates // 无需调整
 	}
+
+	var preferred *config.ModelCandidate
+	var rest []config.ModelCandidate
+
+	// 遍历候选列表，分离首选和其他
+	for _, c := range candidates {
+		if c.ID == preferredID && preferred == nil {
+			tmp := c
+			preferred = &tmp // 找到首选
+			continue
+		}
+		rest = append(rest, c) // 其他候选
+	}
+
+	// 如果没找到首选，返回原列表
+	if preferred == nil {
+		return candidates
+	}
+
+	// 首选放第一位，其他保持原顺序
+	return append([]config.ModelCandidate{*preferred}, rest...)
+}
+
+// filterCandidatesByID 根据模型 ID 过滤候选列表
+// 用于用户指定了特定模型时，只保留该模型
+//
+// 示例：
+//
+//	原列表: [qwen-plus, glm-4, qwen-local]
+//	modelID: "glm-4"
+//	结果: [glm-4]
+func filterCandidatesByID(candidates []config.ModelCandidate, modelID string) []config.ModelCandidate {
+	if modelID == "" {
+		return candidates // 不过滤
+	}
+
+	filtered := make([]config.ModelCandidate, 0, 1)
+	for _, candidate := range candidates {
+		if candidate.ID == modelID {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
 }
 
 // probeAndBridgeStream 首包探测 + 流桥接函数
@@ -282,6 +349,7 @@ func probeAndBridgeStream(ctx context.Context, src <-chan StreamDelta, timeout t
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
+	// 缓冲首包探测期间收到的数据
 	var buffered []StreamDelta
 
 	// 阶段1：首包探测
@@ -289,9 +357,9 @@ func probeAndBridgeStream(ctx context.Context, src <-chan StreamDelta, timeout t
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, ctx.Err() // 上下文取消
 		case <-timer.C:
-			return nil, fmt.Errorf("stream first packet timeout")
+			return nil, fmt.Errorf("stream first packet timeout") // 超时
 		case d, ok := <-src:
 			if !ok {
 				return nil, fmt.Errorf("stream ended before first content") // 流结束但无内容
@@ -300,9 +368,10 @@ func probeAndBridgeStream(ctx context.Context, src <-chan StreamDelta, timeout t
 				return nil, d.Err // API 错误
 			}
 
-			//收到数据，缓存
+			// 收到数据，缓冲起来
 			buffered = append(buffered, d)
 
+			// 检查是否是有效数据包
 			if d.Content != "" || d.IsThinking {
 				// 找到首包！进入阶段2
 				out := make(chan StreamDelta, 64)
@@ -331,7 +400,7 @@ func probeAndBridgeStream(ctx context.Context, src <-chan StreamDelta, timeout t
 						case out <- dd:
 						}
 						if dd.Err != nil {
-							return
+							return // 遇到错误，停止
 						}
 					}
 				}()

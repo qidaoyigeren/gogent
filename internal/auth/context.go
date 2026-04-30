@@ -12,14 +12,18 @@ type LoginUser struct {
 
 type contextKey struct{}
 
+// WithUser stores LoginUser into context.
 func WithUser(ctx context.Context, user *LoginUser) context.Context {
 	return context.WithValue(ctx, contextKey{}, user)
 }
 
+// GetUser retrieves LoginUser from context. Returns nil if not present.
 func GetUser(ctx context.Context) *LoginUser {
-	return ctx.Value(contextKey{}).(*LoginUser)
+	u, _ := ctx.Value(contextKey{}).(*LoginUser)
+	return u
 }
 
+// GetUserID retrieves user ID from context. Returns "" if not present.
 func GetUserID(ctx context.Context) string {
 	u := GetUser(ctx)
 	if u == nil {

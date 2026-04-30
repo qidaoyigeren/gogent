@@ -7,6 +7,7 @@ import (
 	"strings"
 )
 
+// Config 歧义引导配置
 type Config struct {
 	Enabled            bool    `mapstructure:"enabled"`             // 是否启用歧义引导
 	AmbiguityThreshold float64 `mapstructure:"ambiguity-threshold"` // 歧义阈值（分数差值）
@@ -14,6 +15,10 @@ type Config struct {
 }
 
 // Service 歧义引导服务（5 步检测算法）
+// 核心职责：
+// 1. 检测意图结果是否存在歧义
+// 2. 如果歧义严重，构建引导消息让用户选择
+// 3. 返回决策结果（PROCEED/GUIDE/FALLBACK）
 type Service struct {
 	cfg Config
 }
@@ -28,65 +33,65 @@ func NewService(cfg Config) *Service {
 	return &Service{cfg: cfg}
 }
 
-// scored 内部结构体：节点 ID + 分数
-type scored struct {
-	nodeID string
-	score  float64
-}
-
-// Evaluate 检查意图结果是否存在歧义。
+// Evaluate checks if the intent results are ambiguous.
 //
-// 5步判断算法：
-// 1. 如果功能被禁用或没有意图结果 → 继续执行
-// 2. 如果存在单个高置信度的意图 → 继续执行
-// 3. 如果存在来自不同系统的多个意图且名称相似 → 引导用户澄清
-// 4. 如果最高分之间的差距较小（差值小于阈值） → 引导用户澄清
-// 5. 其他情况 → 继续执行
+// 5-step algorithm:
+// 1. If disabled or no intents → PROCEED
+// 2. If single high-confidence intent → PROCEED
+// 3. If multiple intents from different systems with similar names → GUIDE
+// 4. If top scores are close (diff < threshold) → GUIDE
+// 5. Otherwise → PROCEED
 func (s *Service) Evaluate(group *intent.IntentGroup, nodeMap map[string]*intent.IntentNode) GuidanceDecision {
 	if !s.cfg.Enabled {
 		return GuidanceDecision{Type: DecisionProceed}
 	}
 
-	//收集所有scores
+	// Step 1: Collect all scores
 	var allScores []scored
 	for _, sq := range group.SubQuestions {
 		for _, ns := range sq.Scores {
 			allScores = append(allScores, scored{nodeID: ns.NodeID, score: ns.Score})
 		}
 	}
-	//没有意图结果
+
 	if len(allScores) == 0 {
 		return GuidanceDecision{Type: DecisionProceed}
 	}
-	//单个高置信度的意图
+
+	// Step 2: Single high-confidence
 	if len(allScores) == 1 && allScores[0].score >= 0.7 {
 		return GuidanceDecision{Type: DecisionProceed}
 	}
-	//如果存在来自不同系统的多个意图且名称相似
+
+	// Step 3: Check for cross-system name collision
 	if s.hasCrossSystemAmbiguity(allScores, nodeMap) {
 		return s.buildGuidance(allScores, nodeMap)
 	}
-	//如果最高分之间的差距较小（差值小于阈值）
+
+	// Step 4: Check score proximity
 	if len(allScores) >= 2 {
 		top := allScores[0].score
 		second := allScores[1].score
+		// Find actual top two
 		for _, sc := range allScores {
 			if sc.score > top {
 				second = top
 				top = sc.score
-			} else if sc.score > second {
+			} else if sc.score > second && sc.score < top {
 				second = sc.score
 			}
 		}
-		if top-second <= s.cfg.AmbiguityThreshold {
+		if top-second < s.cfg.AmbiguityThreshold {
 			return s.buildGuidance(allScores, nodeMap)
 		}
 	}
-	//其他情况 → 继续执行
+
+	// Step 5: No ambiguity
 	return GuidanceDecision{Type: DecisionProceed}
 }
 
 func (s *Service) hasCrossSystemAmbiguity(scores []scored, nodeMap map[string]*intent.IntentNode) bool {
+	// 按节点名称分组，检查同名节点是否出现在不同父节点下
 	nameToParents := make(map[string]map[string]bool)
 	for _, sc := range scores {
 		node, ok := nodeMap[sc.nodeID]
@@ -98,6 +103,8 @@ func (s *Service) hasCrossSystemAmbiguity(scores []scored, nodeMap map[string]*i
 		}
 		nameToParents[node.Name][node.ParentID] = true
 	}
+
+	// 如果某个名称对应多个父节点 → 跨系统歧义
 	for name, parents := range nameToParents {
 		if len(parents) > 1 {
 			slog.Info("cross-system ambiguity detected", "name", name, "parentCount", len(parents))
@@ -105,6 +112,12 @@ func (s *Service) hasCrossSystemAmbiguity(scores []scored, nodeMap map[string]*i
 		}
 	}
 	return false
+}
+
+// scored 内部结构体：节点 ID + 分数
+type scored struct {
+	nodeID string
+	score  float64
 }
 
 // buildGuidance 构建引导决策结果
@@ -118,6 +131,7 @@ func (s *Service) buildGuidance(scores []scored, nodeMap map[string]*intent.Inte
 	var optionNodeIDs []string
 	seen := make(map[string]bool)
 
+	// 收集选项（最多 MaxOptions 个，默认 4）
 	for _, sc := range scores {
 		if len(options) >= s.cfg.MaxOptions {
 			break
@@ -128,6 +142,7 @@ func (s *Service) buildGuidance(scores []scored, nodeMap map[string]*intent.Inte
 		}
 		seen[sc.nodeID] = true
 
+		// 构建选项文本：名称 + 描述（可选）
 		label := node.Name
 		if node.Description != "" {
 			label += " (" + node.Description + ")"
@@ -135,6 +150,7 @@ func (s *Service) buildGuidance(scores []scored, nodeMap map[string]*intent.Inte
 		options = append(options, label)
 		optionNodeIDs = append(optionNodeIDs, node.ID)
 	}
+
 	// 格式化引导消息
 	msg := fmt.Sprintf("%s，请选择您想了解的具体内容：\n%s",
 		AmbiguityPromptPrefix,

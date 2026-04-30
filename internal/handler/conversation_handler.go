@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 )
 
+// ConversationHandler 只依赖 DB，不涉及 LLM/Redis。
 type ConversationHandler struct {
 	db *gorm.DB
 }
@@ -117,7 +118,7 @@ func (h *ConversationHandler) listMessages(c *gin.Context) {
 	convID := c.Param("conversationId")
 	userID := auth.GetUserID(c.Request.Context())
 
-	// 越权保护：找不到归属时返回空数组
+	// 越权保护：找不到归属时返回空数组（对齐 Java）
 	var conv entity.ConversationDO
 	if h.db.Where("conversation_id = ? AND user_id = ? AND deleted = 0", convID, userID).First(&conv).Error != nil {
 		response.Success(c, []struct{}{})

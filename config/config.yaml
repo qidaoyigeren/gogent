@@ -1,6 +1,10 @@
 server:
   port: 9090
   context-path: /api/ragent
+  # Set a strong random secret in production (e.g. openssl rand -base64 32)
+  jwt-secret: ""
+  demo-mode: false
+  upload-max-concurrent: 3
 
 database:
   driver: postgres
@@ -55,9 +59,13 @@ rag:
   search:
     channels:
       vector-global:
+        # enabled: true   # omit = true; set false to disable channel
+        # priority: 10    # omit = built-in default (lower runs first)
         confidence-threshold: 0.6
         top-k-multiplier: 3
       intent-directed:
+        # enabled: true
+        # priority: 1
         min-intent-score: 0.4
         top-k-multiplier: 2
 

@@ -32,11 +32,13 @@ type taskEntry struct {
 	cancel    context.CancelFunc // 注册时传入：cancel 后编排 ctx 会立即唤醒 Done
 	cancelled atomic.Bool        // CAS 防重复 cancel
 	mu        sync.Mutex         // 保护 streamStop 字段的读写
+	// streamStop 对应 Java StreamCancellationHandle：
 	// 编排层拿到 LLM 流后会调 BindHandle 注册，cancel 时除了 ctx 还会显式关闭上游流。
 	// 可为 nil（任务还没进入 LLM 阶段就被 cancel 的情况）。
 	streamStop func()
 }
 
+// globalTaskManager 单例。main 里通过 GetTaskManager() 取，避免多处 new 出多个管理器导致分片。
 var globalTaskManager = &StreamTaskManager{}
 
 func GetTaskManager() *StreamTaskManager {
@@ -51,6 +53,8 @@ const (
 // EnableDistributedCancel 启用分布式取消：
 //   - 订阅 cancelTopic，收到 taskID 后本地 cancelLocal
 //   - ttl 控制标记键的过期时间，默认 30min 保护性超时
+//
+// 多次调用安全：订阅只启动一次；rdb/ttl 可多次覆盖（生产中一般一次性设置）。
 func (m *StreamTaskManager) EnableDistributedCancel(rdb *redis.Client, ttl time.Duration) {
 	if rdb == nil {
 		return
@@ -58,11 +62,13 @@ func (m *StreamTaskManager) EnableDistributedCancel(rdb *redis.Client, ttl time.
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	m.rdb, m.ttl = rdb, ttl
+	m.rdb = rdb
+	m.ttl = ttl
 
 	m.subOnce.Do(func() {
 		sub := rdb.Subscribe(context.Background(), cancelTopic)
 		go func() {
+			// 后台长驻协程：进程存活期间一直订阅
 			for msg := range sub.Channel() {
 				taskID := msg.Payload
 				if taskID == "" {
@@ -72,29 +78,6 @@ func (m *StreamTaskManager) EnableDistributedCancel(rdb *redis.Client, ttl time.
 			}
 		}()
 	})
-}
-
-// cancelLocal 仅在本实例内 cancel；通过 CAS 保证只执行一次。
-// 顺序：先 streamStop（关闭 LLM 连接）再 cancel ctx（让编排 Goroutine 退出）。
-// 为什么这个顺序：若 ctx cancel 在前，LLM HTTP 连接可能由 read goroutine 持有，
-// 此时调 stop 能更快释放网络资源。
-func (m *StreamTaskManager) cancelLocal(taskID string) bool {
-	v, ok := m.tasks.Load(taskID)
-	if !ok {
-		return false
-	}
-	e := v.(*taskEntry)
-	if !e.cancelled.CompareAndSwap(false, true) {
-		return false
-	}
-	e.mu.Lock()
-	stop := e.streamStop
-	e.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
-	e.cancel()
-	return true
 }
 
 // Register 登记一个 taskID 及其 ctx 的 CancelFunc。
@@ -109,7 +92,7 @@ func (m *StreamTaskManager) Register(taskID string, cancel context.CancelFunc) {
 	}
 }
 
-// BindHandle 在流式 LLM 开始后注册“停流”回调
+// BindHandle 在流式 LLM 开始后注册“停流”回调；对齐 Java StreamTaskManager#bindHandle。
 // 若任务在注册 stop 前已经被 cancel（边缘竞态），立即在当前 goroutine 调用 stop，保证不泄漏上游连接。
 // stop 必须幂等：可能被本函数、cancelLocal 都触发一次。
 func (m *StreamTaskManager) BindHandle(taskID string, stop func()) {
@@ -138,10 +121,34 @@ func (m *StreamTaskManager) Cancel(taskID string) bool {
 		return false
 	}
 	if m.rdb != nil {
+		// 写标记：其他实例若在此之后才 Register，也能立即识别“这个 task 已被取消”
 		_ = m.rdb.Set(context.Background(), cancelKeyPrefix+taskID, "1", m.ttl).Err()
 		_ = m.rdb.Publish(context.Background(), cancelTopic, taskID).Err()
 	}
 	return m.cancelLocal(taskID)
+}
+
+// cancelLocal 仅在本实例内 cancel；通过 CAS 保证只执行一次。
+// 顺序：先 streamStop（关闭 LLM 连接）再 cancel ctx（让编排 Goroutine 退出）。
+// 为什么这个顺序：若 ctx cancel 在前，LLM HTTP 连接可能由 read goroutine 持有，
+// 此时调 stop 能更快释放网络资源。
+func (m *StreamTaskManager) cancelLocal(taskID string) bool {
+	v, ok := m.tasks.Load(taskID)
+	if !ok {
+		return false
+	}
+	e := v.(*taskEntry)
+	if !e.cancelled.CompareAndSwap(false, true) {
+		return false
+	}
+	e.mu.Lock()
+	stop := e.streamStop
+	e.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	e.cancel()
+	return true
 }
 
 // Unregister 在 handler 结束时 defer 调用。

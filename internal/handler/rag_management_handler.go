@@ -71,11 +71,13 @@ func (h *IntentTreeHandler) RegisterRoutes(rg *gin.RouterGroup) {
 func (h *IntentTreeHandler) tree(c *gin.Context) {
 	var nodes []entity.IntentNodeDO
 	h.db.Where("deleted = ?", 0).Order("sort_order ASC").Find(&nodes)
+	// Build tree
 	tree := buildIntentTree(nodes)
 	response.Success(c, tree)
 }
 
 func buildIntentTree(nodes []entity.IntentNodeDO) []IntentNodeVO {
+	// Build VO list and map by intentCode (Java groups children by parentCode → intentCode)
 	codeMap := make(map[string]*IntentNodeVO, len(nodes))
 	var voList []*IntentNodeVO
 	for i := range nodes {
@@ -102,6 +104,7 @@ func buildIntentTree(nodes []entity.IntentNodeDO) []IntentNodeVO {
 		codeMap[n.IntentCode] = vo
 		voList = append(voList, vo)
 	}
+	// Build parent-child relationships using intentCode as key
 	var roots []IntentNodeVO
 	for _, vo := range voList {
 		if vo.ParentCode == "" {
@@ -164,7 +167,7 @@ func (h *IntentTreeHandler) create(c *gin.Context) {
 
 	// Validate: intentCode must be unique
 	var cnt int64
-	h.db.Model(&entity.IntentNodeDO{}).Where("intent_code = ?", req.IntentCode).Count(&cnt)
+	h.db.Model(&entity.IntentNodeDO{}).Where("intent_code = ? AND deleted = 0", req.IntentCode).Count(&cnt)
 	if cnt > 0 {
 		response.FailWithCode(c, errcode.ClientError, "意图标识已存在: "+req.IntentCode)
 		return
@@ -237,10 +240,10 @@ func (h *IntentTreeHandler) update(c *gin.Context) {
 		response.FailWithCode(c, errcode.ClientError, "invalid request")
 		return
 	}
-	//如果kbid改变了,collectionName也要相应改变，二者是强捆绑的
-	if kbID, ok := req["kbId"]; kbID != nil && ok && kbID != "" {
+	// If kbId changed, resolve collectionName
+	if kbID, ok := req["kbId"]; ok && kbID != nil && kbID != "" {
 		var kb entity.KnowledgeBaseDO
-		if h.db.Where("id = ? AND deleted = 0", id).First(&kb).Error == nil {
+		if h.db.Where("id = ? AND deleted = 0", kbID).First(&kb).Error == nil {
 			req["collectionName"] = kb.CollectionName
 		}
 	}
@@ -260,15 +263,7 @@ func (h *IntentTreeHandler) update(c *gin.Context) {
 
 func (h *IntentTreeHandler) delete(c *gin.Context) {
 	id := c.Param("id")
-	result := h.db.Model(&entity.IntentNodeDO{}).Where("id = ? AND deleted = 0", id).Update("deleted", 1)
-	if result.Error != nil {
-		response.FailWithCode(c, errcode.ClientError, "删除失败: "+result.Error.Error())
-		return
-	}
-	if result.RowsAffected == 0 {
-		response.FailWithCode(c, errcode.ClientError, "节点不存在或已删除")
-		return
-	}
+	h.db.Model(&entity.IntentNodeDO{}).Where("id = ? AND deleted = 0", id).Update("deleted", 1)
 	if cache := intent.DefaultTreeCache(); cache != nil {
 		cache.InvalidateCache(c.Request.Context())
 	}
@@ -279,10 +274,7 @@ func (h *IntentTreeHandler) batchEnable(c *gin.Context) {
 	var req struct {
 		IDs []string `json:"ids"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithCode(c, errcode.ClientError, "请求参数错误")
-		return
-	}
+	c.ShouldBindJSON(&req)
 	h.db.Model(&entity.IntentNodeDO{}).Where("id IN ? AND deleted = 0", req.IDs).Update("enabled", 1)
 	if cache := intent.DefaultTreeCache(); cache != nil {
 		cache.InvalidateCache(c.Request.Context())
@@ -298,24 +290,21 @@ func (h *IntentTreeHandler) batchDisable(c *gin.Context) {
 		response.FailWithCode(c, errcode.ClientError, "请求参数错误")
 		return
 	}
-	//得到目标节点集合和所有节点集合
 	targetNodes, allNodes, err := h.listAndValidateTargetNodes(req.IDs)
 	if err != nil {
 		response.FailWithCode(c, errcode.ClientError, err.Error())
 		return
 	}
-	//构筑邻接表
 	childrenMap := buildChildrenMap(allNodes)
-	//对于每个目标节点，收集他们正在启用的子节点，看有无启用子节点存在阻止关闭
 	targetSet := make(map[string]struct{}, len(targetNodes))
-	for _, node := range targetNodes {
-		targetSet[node.ID] = struct{}{}
-	}
 	for _, n := range targetNodes {
-		desc := collectDescendants(n.IntentCode, childrenMap)
+		targetSet[n.ID] = struct{}{}
+	}
+	for _, target := range targetNodes {
+		desc := collectDescendants(target.IntentCode, childrenMap)
 		var enabledButNotSelected []entity.IntentNodeDO
 		for _, d := range desc {
-			if d.Enabled == 1 && d.ID != n.ID {
+			if d.Enabled == 1 {
 				if _, ok := targetSet[d.ID]; !ok {
 					enabledButNotSelected = append(enabledButNotSelected, d)
 				}
@@ -324,14 +313,13 @@ func (h *IntentTreeHandler) batchDisable(c *gin.Context) {
 		if len(enabledButNotSelected) > 0 {
 			response.FailWithCode(c, errcode.ClientError,
 				fmt.Sprintf("批量停用失败：节点 [%s] 存在已启用的子节点未包含在本次操作中（如：%s），请先选择全量子节点",
-					displayNodeName(n), summarizeNodeNames(enabledButNotSelected)))
+					displayNodeName(target), summarizeNodeNames(enabledButNotSelected)))
 			return
 		}
 	}
-	//disable节点并删除缓存
 	targetIDs := make([]string, 0, len(targetNodes))
-	for _, node := range targetNodes {
-		targetIDs = append(targetIDs, node.ID)
+	for _, n := range targetNodes {
+		targetIDs = append(targetIDs, n.ID)
 	}
 	h.db.Model(&entity.IntentNodeDO{}).Where("id IN ? AND deleted = 0", targetIDs).Update("enabled", 0)
 	if cache := intent.DefaultTreeCache(); cache != nil {
@@ -348,43 +336,39 @@ func (h *IntentTreeHandler) batchDelete(c *gin.Context) {
 		response.FailWithCode(c, errcode.ClientError, "请求参数错误")
 		return
 	}
-	//得到目标节点集合和所有节点集合
 	targetNodes, allNodes, err := h.listAndValidateTargetNodes(req.IDs)
 	if err != nil {
 		response.FailWithCode(c, errcode.ClientError, err.Error())
 		return
 	}
-	//构筑邻接表
 	childrenMap := buildChildrenMap(allNodes)
-	//对于每个目标节点，收集他们正在启用的子节点，看有无启用子节点存在阻止关闭
 	targetSet := make(map[string]struct{}, len(targetNodes))
-	for _, node := range targetNodes {
-		targetSet[node.ID] = struct{}{}
-	}
 	for _, n := range targetNodes {
-		desc := collectDescendants(n.IntentCode, childrenMap)
-		var enabledButNotSelected []entity.IntentNodeDO
+		targetSet[n.ID] = struct{}{}
+	}
+	for _, target := range targetNodes {
+		desc := collectDescendants(target.IntentCode, childrenMap)
 		var notSelected []entity.IntentNodeDO
+		var enabledNotSelected []entity.IntentNodeDO
 		for _, d := range desc {
-			if d.Enabled == 1 && d.ID != n.ID {
-				if _, ok := targetSet[d.ID]; !ok {
-					enabledButNotSelected = append(enabledButNotSelected, d)
-				}
+			if _, ok := targetSet[d.ID]; ok {
+				continue
 			}
-			if _, ok := targetSet[d.ID]; !ok {
-				notSelected = append(notSelected, d)
+			notSelected = append(notSelected, d)
+			if d.Enabled == 1 {
+				enabledNotSelected = append(enabledNotSelected, d)
 			}
 		}
-		if len(enabledButNotSelected) > 0 {
+		if len(enabledNotSelected) > 0 {
 			response.FailWithCode(c, errcode.ClientError,
 				fmt.Sprintf("批量删除失败：节点 [%s] 存在已启用的子节点未包含在本次操作中（如：%s），请先选择全量子节点",
-					displayNodeName(n), summarizeNodeNames(enabledButNotSelected)))
+					displayNodeName(target), summarizeNodeNames(enabledNotSelected)))
 			return
 		}
 		if len(notSelected) > 0 {
 			response.FailWithCode(c, errcode.ClientError,
 				fmt.Sprintf("批量删除失败：节点 [%s] 未包含全量子节点（如：%s），请先勾选完整子树后再删除",
-					displayNodeName(n), summarizeNodeNames(notSelected)))
+					displayNodeName(target), summarizeNodeNames(notSelected)))
 			return
 		}
 	}
@@ -399,7 +383,34 @@ func (h *IntentTreeHandler) batchDelete(c *gin.Context) {
 	response.SuccessEmpty(c)
 }
 
-// 避免重复 ID、空字符串导致误判或重复处理。
+func (h *IntentTreeHandler) listAndValidateTargetNodes(ids []string) ([]entity.IntentNodeDO, []entity.IntentNodeDO, error) {
+	normalized := normalizeIDs(ids)
+	if len(normalized) == 0 {
+		return nil, nil, fmt.Errorf("请至少选择一个节点")
+	}
+	var allNodes []entity.IntentNodeDO
+	if err := h.db.Where("deleted = 0").Find(&allNodes).Error; err != nil {
+		return nil, nil, err
+	}
+	nodeByID := make(map[string]entity.IntentNodeDO, len(allNodes))
+	for _, n := range allNodes {
+		nodeByID[n.ID] = n
+	}
+	targetNodes := make([]entity.IntentNodeDO, 0, len(normalized))
+	missing := make([]string, 0)
+	for _, id := range normalized {
+		if n, ok := nodeByID[id]; ok {
+			targetNodes = append(targetNodes, n)
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, nil, fmt.Errorf("节点不存在或已删除: %s", strings.Join(missing, ", "))
+	}
+	return targetNodes, allNodes, nil
+}
+
 func normalizeIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	out := make([]string, 0, len(ids))
@@ -417,38 +428,6 @@ func normalizeIDs(ids []string) []string {
 	return out
 }
 
-// 先拿清洗后的 ID，读出全量未删除节点，再校验目标 ID 是否都真实存在。
-// 给后续“树校验”准备可靠输入，先把“节点不存在/已删”挡掉。
-func (h *IntentTreeHandler) listAndValidateTargetNodes(ids []string) ([]entity.IntentNodeDO, []entity.IntentNodeDO, error) {
-	normalized := normalizeIDs(ids)
-	if len(normalized) == 0 {
-		return nil, nil, fmt.Errorf("请至少选择一个节点")
-	}
-	var allNodes []entity.IntentNodeDO
-
-	if err := h.db.Where("deleted = ?", 0).Find(&allNodes).Error; err != nil {
-		return nil, nil, err
-	}
-	nodesByID := make(map[string]entity.IntentNodeDO, len(allNodes))
-	for _, node := range allNodes {
-		nodesByID[node.ID] = node
-	}
-	targetNodes := make([]entity.IntentNodeDO, 0, len(normalized))
-	missing := make([]string, 0)
-	for _, id := range normalized {
-		if n, ok := nodesByID[id]; ok {
-			targetNodes = append(targetNodes, n)
-		} else {
-			missing = append(missing, id)
-		}
-	}
-	if len(missing) > 0 {
-		return nil, nil, fmt.Errorf("节点不存在或已删除: %s", strings.Join(missing, ", "))
-	}
-	return targetNodes, allNodes, nil
-}
-
-// 把节点数组转成 parentCode -> []child 的邻接表。
 func buildChildrenMap(nodes []entity.IntentNodeDO) map[string][]entity.IntentNodeDO {
 	m := make(map[string][]entity.IntentNodeDO, len(nodes))
 	for _, n := range nodes {
@@ -461,7 +440,6 @@ func buildChildrenMap(nodes []entity.IntentNodeDO) map[string][]entity.IntentNod
 	return m
 }
 
-// 从某个节点开始 DFS，把所有后代节点收集出来。
 func collectDescendants(intentCode string, childrenMap map[string][]entity.IntentNodeDO) []entity.IntentNodeDO {
 	if strings.TrimSpace(intentCode) == "" {
 		return nil
@@ -480,7 +458,6 @@ func collectDescendants(intentCode string, childrenMap map[string][]entity.Inten
 	return out
 }
 
-// 把违规节点名压缩成可读提示（最多几个名字）。
 func summarizeNodeNames(nodes []entity.IntentNodeDO) string {
 	if len(nodes) == 0 {
 		return ""
@@ -521,18 +498,23 @@ func (h *MappingHandler) RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 func (h *MappingHandler) page(c *gin.Context) {
-	pageNo, size := response.ParsePage(c)
+	pageNo, pageSize := response.ParsePage(c)
+	keyword := strings.TrimSpace(c.Query("keyword"))
 	var list []entity.QueryTermMappingDO
 	var total int64
-	h.db.Model(&entity.QueryTermMappingDO{}).Where("deleted = ?", 0).Count(&total)
-	h.db.Where("deleted = ?", 0).Offset((pageNo - 1) * size).Limit(size).Order("create_time DESC").Find(&list)
-	response.SuccessPage(c, list, total, pageNo, size)
+	q := h.db.Model(&entity.QueryTermMappingDO{}).Where("deleted = 0")
+	if keyword != "" {
+		q = q.Where("source_term LIKE ? OR target_term LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
+	}
+	q.Count(&total)
+	q.Offset((pageNo - 1) * pageSize).Limit(pageSize).Order("update_time DESC").Find(&list)
+	response.SuccessPage(c, list, total, pageNo, pageSize)
 }
 
 func (h *MappingHandler) get(c *gin.Context) {
 	id := c.Param("id")
 	var m entity.QueryTermMappingDO
-	if err := h.db.Where("id = ? AND deleted = ?", id, 0).First(&m).Error; err != nil {
+	if err := h.db.Where("id = ? AND deleted = 0", id).First(&m).Error; err != nil {
 		response.FailWithCode(c, errcode.ClientError, "mapping not found")
 		return
 	}
@@ -639,8 +621,8 @@ func (h *MappingHandler) reloadTermMapper() {
 	}
 	var records []termMappingRow
 	h.db.Model(&entity.QueryTermMappingDO{}).
-		Select("source_term, target_term, match_type, priority").
-		Where("deleted = 0 AND  CAST(enabled AS TEXT) IN  ('1','true','t')").
+		Select("source_term", "target_term", "match_type", "priority").
+		Where("deleted = 0 AND CAST(enabled AS TEXT) IN ('1','true','t')").
 		Order("priority DESC").
 		Find(&records)
 	mappings := make([]rewrite.TermMapping, 0, len(records))
@@ -672,7 +654,7 @@ func (h *SampleQuestionHandler) RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 func (h *SampleQuestionHandler) page(c *gin.Context) {
-	pageNo, size := response.ParsePage(c)
+	pageNo, pageSize := response.ParsePage(c)
 	keyword := strings.TrimSpace(c.Query("keyword"))
 	var list []entity.SampleQuestionDO
 	var total int64
@@ -680,13 +662,14 @@ func (h *SampleQuestionHandler) page(c *gin.Context) {
 	if keyword != "" {
 		q = q.Where("question LIKE ? OR title LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
 	}
-	q.Count(&total).Offset((pageNo - 1) * size).Limit(size).Find(&list)
-	response.SuccessPage(c, list, total, pageNo, size)
+	q.Count(&total)
+	q.Offset((pageNo - 1) * pageSize).Limit(pageSize).Order("create_time DESC").Find(&list)
+	response.SuccessPage(c, list, total, pageNo, pageSize)
 }
 
 func (h *SampleQuestionHandler) random(c *gin.Context) {
 	var list []entity.SampleQuestionDO
-	h.db.Where("deleted = 0").Order("RANDOM()").Limit(6).Find(&list)
+	h.db.Where("deleted = ?", 0).Order("RANDOM()").Limit(6).Find(&list)
 	response.Success(c, list)
 }
 
@@ -726,33 +709,12 @@ func (h *SampleQuestionHandler) update(c *gin.Context) {
 		response.FailWithCode(c, errcode.ClientError, "invalid request")
 		return
 	}
-	// 自动设置 updated_by
-	req["update_by"] = auth.GetUserID(c.Request.Context())
-	result := h.db.Model(&entity.SampleQuestionDO{}).Where("id = ? AND deleted = 0", id).Updates(req)
-	if result.Error != nil {
-		response.FailWithCode(c, errcode.ClientError, "更新失败: "+result.Error.Error())
-		return
-	}
-	if result.RowsAffected == 0 {
-		response.FailWithCode(c, errcode.ClientError, "问题不存在或已删除")
-		return
-	}
+	h.db.Model(&entity.SampleQuestionDO{}).Where("id = ? AND deleted = 0", id).Updates(req)
 	response.SuccessEmpty(c)
 }
 
 func (h *SampleQuestionHandler) delete(c *gin.Context) {
 	id := c.Param("id")
-	result := h.db.Model(&entity.SampleQuestionDO{}).Where("id = ? AND deleted = 0", id).Updates(map[string]interface{}{
-		"deleted":    1,
-		"updated_by": auth.GetUserID(c.Request.Context()),
-	})
-	if result.Error != nil {
-		response.FailWithCode(c, errcode.ClientError, "删除失败: "+result.Error.Error())
-		return
-	}
-	if result.RowsAffected == 0 {
-		response.FailWithCode(c, errcode.ClientError, "问题不存在或已删除")
-		return
-	}
+	h.db.Model(&entity.SampleQuestionDO{}).Where("id = ? AND deleted = 0", id).Update("deleted", 1)
 	response.SuccessEmpty(c)
 }

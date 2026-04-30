@@ -13,7 +13,6 @@ import "encoding/json"
 //   error（可选，替代 finish）    ← 流中途错误，前端保留错误提示，不再期望 finish
 //   done                         ← 永远最后一帧：data='"[DONE]"'，前端据此关闭 EventSource
 
-// SSE event 名称常量：与 Java SSEEventType enum 同名，方便跨语言排障。
 const (
 	EventMeta    = "meta"    // 首帧：下发 conversationId / taskId
 	EventMessage = "message" // 主体：流式文本增量

@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 )
 
+// TraceHandler 薄封装：db 本身不用但保留以便未来扩展；真正的查询走 querySvc。
 type TraceHandler struct {
 	db       *gorm.DB
 	querySvc *service.RagTraceQueryService
@@ -17,6 +18,7 @@ type TraceHandler struct {
 func NewTraceHandler(db *gorm.DB) *TraceHandler {
 	return &TraceHandler{db: db, querySvc: service.NewRagTraceQueryService(db)}
 }
+
 func (h *TraceHandler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/rag/traces/runs", h.pageRuns)
 	rg.GET("/rag/traces/runs/:traceId", h.detail)
