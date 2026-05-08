@@ -2,9 +2,12 @@ package handler
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gogent/internal/mq"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -12,7 +15,7 @@ import (
 //流式任务注册与分布式取消
 ////
 //// ========================= 要解决的问题 =========================
-//// 客户端点“停止生成”时：
+//// 客户端点"停止生成"时：
 ////   1) 当前实例必须 context.Cancel，停掉编排（检索/LLM 都监听 ctx）；
 ////   2) 如果请求落在 A 实例、但 stop 打到 B 实例（负载均衡下常见），需要跨实例广播；
 ////   3) 即便 ctx 被 cancel，LLM HTTP 流可能还在读，需要显式调用 LLM SDK 的 stop 回调关闭底层连接。
@@ -22,6 +25,7 @@ import (
 type StreamTaskManager struct {
 	tasks sync.Map // key: taskID(string), value: *taskEntry
 	rdb   *redis.Client
+	nats  *mq.NATSPublisher
 	ttl   time.Duration
 
 	subOnce sync.Once // 保证订阅协程只启动一次
@@ -46,37 +50,42 @@ func GetTaskManager() *StreamTaskManager {
 }
 
 const (
-	cancelTopic     = "ragent:stream:cancel"  // Pub/Sub 频道
-	cancelKeyPrefix = "ragent:stream:cancel:" // Register 时检查的“已被取消”标记键前缀
+	cancelSubject   = "ragent.stream.cancel"  // NATS subject
+	cancelKeyPrefix = "ragent:stream:cancel:" // Register 时检查的"已被取消"标记键前缀
 )
 
 // EnableDistributedCancel 启用分布式取消：
-//   - 订阅 cancelTopic，收到 taskID 后本地 cancelLocal
+//   - 通过 NATS 订阅 cancelSubject，收到 taskID 后本地 cancelLocal
+//   - Redis 仅用于 marker key（SET/GET/DEL），不用于 pub/sub
 //   - ttl 控制标记键的过期时间，默认 30min 保护性超时
 //
-// 多次调用安全：订阅只启动一次；rdb/ttl 可多次覆盖（生产中一般一次性设置）。
-func (m *StreamTaskManager) EnableDistributedCancel(rdb *redis.Client, ttl time.Duration) {
-	if rdb == nil {
+// 多次调用安全：订阅只启动一次；rdb/nats/ttl 可多次覆盖（生产中一般一次性设置）。
+func (m *StreamTaskManager) EnableDistributedCancel(rdb *redis.Client, natsPub *mq.NATSPublisher, ttl time.Duration) {
+	if rdb == nil && natsPub == nil {
 		return
 	}
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
 	m.rdb = rdb
+	m.nats = natsPub
 	m.ttl = ttl
 
+	if natsPub == nil {
+		return
+	}
+
 	m.subOnce.Do(func() {
-		sub := rdb.Subscribe(context.Background(), cancelTopic)
-		go func() {
-			// 后台长驻协程：进程存活期间一直订阅
-			for msg := range sub.Channel() {
-				taskID := msg.Payload
-				if taskID == "" {
-					continue
-				}
-				m.cancelLocal(taskID)
+		_, err := natsPub.Subscribe(cancelSubject, func(data []byte) {
+			taskID := string(data)
+			if taskID == "" {
+				return
 			}
-		}()
+			m.cancelLocal(taskID)
+		})
+		if err != nil {
+			slog.Error("failed to subscribe to NATS cancel subject", "err", err)
+		}
 	})
 }
 
@@ -92,7 +101,7 @@ func (m *StreamTaskManager) Register(taskID string, cancel context.CancelFunc) {
 	}
 }
 
-// BindHandle 在流式 LLM 开始后注册“停流”回调；对齐 Java StreamTaskManager#bindHandle。
+// BindHandle 在流式 LLM 开始后注册"停流"回调；
 // 若任务在注册 stop 前已经被 cancel（边缘竞态），立即在当前 goroutine 调用 stop，保证不泄漏上游连接。
 // stop 必须幂等：可能被本函数、cancelLocal 都触发一次。
 func (m *StreamTaskManager) BindHandle(taskID string, stop func()) {
@@ -114,16 +123,19 @@ func (m *StreamTaskManager) BindHandle(taskID string, stop func()) {
 }
 
 // Cancel 对外入口：由 /rag/v3/stop 路由或其他实例触发。
-// 先写 Redis 标记键 + Publish（跨实例通知），然后本地 cancelLocal。
+// 先写 Redis 标记键 + NATS Publish（跨实例通知），然后本地 cancelLocal。
 // 返回 true 表示本地确实有登记并且这是第一次 cancel；false 表示未注册或已 cancel。
 func (m *StreamTaskManager) Cancel(taskID string) bool {
 	if taskID == "" {
 		return false
 	}
+	// 写标记：其他实例若在此之后才 Register，也能立即识别"这个 task 已被取消"
 	if m.rdb != nil {
-		// 写标记：其他实例若在此之后才 Register，也能立即识别“这个 task 已被取消”
 		_ = m.rdb.Set(context.Background(), cancelKeyPrefix+taskID, "1", m.ttl).Err()
-		_ = m.rdb.Publish(context.Background(), cancelTopic, taskID).Err()
+	}
+	// 通过 NATS 广播跨实例通知
+	if m.nats != nil {
+		_ = m.nats.PublishRaw(cancelSubject, []byte(taskID))
 	}
 	return m.cancelLocal(taskID)
 }

@@ -173,7 +173,6 @@ func (s *RAGChatService) Chat(ctx context.Context, req ChatRequest) (*ChatResult
 }
 
 // doChat 串起所有阶段；每个阶段都通过 tracer.RecordNode 包一层。
-// 为保持可读性，各阶段顺序与 Java 版本 RAGChatServiceImpl 严格对齐。
 func (s *RAGChatService) doChat(ctx context.Context, req ChatRequest, tracer *service.TraceRecorder) (*ChatResult, error) {
 	// ========================= 1. 加载记忆 =========================
 	var memCtx *memory.MemoryContext
@@ -232,7 +231,7 @@ func (s *RAGChatService) doChat(ctx context.Context, req ChatRequest, tracer *se
 	})
 
 	// ========================= 4–5. 歧义引导与仅系统意图短路 =========================
-	// 注意：这里的顺序与 Java RAGChatServiceImpl 严格一致：先处理歧义/引导，再判定仅系统。
+	// 先处理歧义/引导，再判定仅系统。
 	roots, _ := s.intentCache.GetRoots(ctx)
 
 	// 若用户上一轮收到"1/2/3"引导后，本轮只输入数字，尝试把选择转成强制 intent
@@ -332,7 +331,7 @@ func (s *RAGChatService) doChat(ctx context.Context, req ChatRequest, tracer *se
 		return s.streamSystemResponse(ctx, req, rewriteResult.Rewritten, memCtx, "", tracer)
 	}
 
-	// 有目标但都没检到 → Java 的固定兜底回复
+	// 有目标但都没检到 → 固定兜底回复
 	if len(chunks) == 0 && len(mcpCalls) == 0 {
 		return s.emptyRetrievalAnswer(ctx, req)
 	}
@@ -669,7 +668,7 @@ func cloneFloatMap(m map[string]float64) map[string]float64 {
 // buildSubQuestionPlans 把 IntentGroup + node 元数据组合成每子问的执行计划。
 // 规则：
 //   - 分数低于 IntentMinScore 的 Score 直接跳过
-//   - KB 和 MCP 两条分支并行处理，不互相短路（Java filterKbIntents/filterMCPIntents 对齐）
+//   - KB 和 MCP 两条分支并行处理，不互相短路
 //   - TopK 取该子问所有命中节点里最大的一个（更强意图覆盖更大召回窗口）
 //   - 完全无 plan 时用 fallbackQuestion（通常是 rewrite 后的原问题）兜底
 func buildSubQuestionPlans(group *intent.IntentGroup, nodeMap map[string]*intent.IntentNode, fallbackQuestion string) []subQuestionPlan {

@@ -14,6 +14,7 @@ type AppConfig struct {
 	Server    ServerConfig    `mapstructure:"server"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Redis     RedisConfig     `mapstructure:"redis"`
+	NATS      NATSConfig      `mapstructure:"nats"`
 	Milvus    MilvusConfig    `mapstructure:"milvus"`
 	RAG       RAGConfig       `mapstructure:"rag"`
 	AI        AIConfig        `mapstructure:"ai"`
@@ -41,6 +42,10 @@ type RedisConfig struct {
 	Addr     string `mapstructure:"addr"`
 	Password string `mapstructure:"password"`
 	DB       int    `mapstructure:"db"`
+}
+
+type NATSConfig struct {
+	URL string `mapstructure:"url"`
 }
 
 type MilvusConfig struct {

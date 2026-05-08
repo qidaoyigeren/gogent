@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"gogent/internal/mq"
 	"gogent/pkg/idgen"
 	"strconv"
 	"sync"
@@ -12,8 +13,8 @@ import (
 )
 
 // ========================= 场景 =========================
-// RAG 问答极度吃 LLM/向量库资源，必须做“全局并发上限”。直接拒绝体验太差，
-// 所以采用 “排队 + 信号量” 的组合：
+// RAG 问答极度吃 LLM/向量库资源，必须做"全局并发上限"。直接拒绝体验太差，
+// 所以采用 "排队 + 信号量" 的组合：
 //   - 信号量 slot 数 = MaxConcurrent（允许同时在跑的请求数）
 //   - 超过 slot 则进队列，按 FIFO 顺序等待；超过 MaxWaitSeconds 就返回限流错误
 // chat_handler 在 Acquire 成功后 defer Release，保证槽位一定归还。
@@ -22,19 +23,22 @@ import (
 // semaphoreKey   (SET)  ：当前持有 lease 的集合；SCARD 得到已占用槽位数
 // queueKey       (ZSET) ：请求 ID 按 score 升序排队；score = 单调递增序号（FIFO）
 // queueSeqKey    (STRING INCR) ：单调序号源；配合 ZADD 保证入队顺序稳定
-// pubsubChannel  (Pub/Sub) ：释放 slot 时发消息，让排队中的协程立即重试（降低 polling 时延）
+//
+// ========================= NATS =========================
+// 释放 slot 时通过 NATS 发消息，让排队中的协程立即重试（降低 polling 时延）
 //
 // ========================= 两把原子 Lua =========================
-// claimQueueHeadLua  ：原子判定“我是不是队头 N 个之一” + ZREM，避免多个实例误判
+// claimQueueHeadLua  ：原子判定"我是不是队头 N 个之一" + ZREM，避免多个实例误判
 // tryAcquire 脚本    ：原子 SCARD 检查 + SADD，避免超卖槽位
 //
 // ========================= 容错 =========================
 // Enabled=false 时 Acquire/Release 全部 no-op（返回空 leaseID），兼容本地开发无 Redis 的情况。
+// NATS 不可用时降级为纯轮询（polling ticker 兜底）。
 // leaseSeconds 给 SET 加 TTL，防止宿主宕机导致 slot 被永久占住。
 
-// 行为：ZRANK(queue, requestId) < maxRank → 视为“队头 N 个”，原子 ZREM 拿走 score；否则返回 {0}。
+// 行为：ZRANK(queue, requestId) < maxRank → 视为"队头 N 个"，原子 ZREM 拿走 score；否则返回 {0}。
 // 返回 {1, score} 表示成功 claim；{0} 表示没轮到或已被别人抢走。
-// 原子性重点：ZRANK + ZREM 必须在一次 Lua 内完成，否则会出现“A 看到自己是队头，但 B 也同时看到”的双主问题。
+// 原子性重点：ZRANK + ZREM 必须在一次 Lua 内完成，否则会出现"A 看到自己是队头，但 B 也同时看到"的双主问题。
 const claimQueueHeadLua = `
 local queueKey = KEYS[1]
 local requestId = ARGV[1]
@@ -50,16 +54,17 @@ return {1, score}
 // RateLimiter 实现分布式限流：
 //  1. 每个请求生成唯一 requestID → ZADD 进队（score 单调递增保证 FIFO）
 //  2. 循环：检测可用 slot → 判定是否队头 → 原子拿 slot
-//  3. 成功返回 leaseID；Release 时 SRem slot 并 publish 通知下一位
+//  3. 成功返回 leaseID；Release 时 SRem slot 并通过 NATS publish 通知下一位
 type RateLimiter struct {
-	rdb *redis.Client
-	cfg RateLimitConfig
+	rdb  *redis.Client
+	nats *mq.NATSPublisher
+	cfg  RateLimitConfig
 
 	// Redis key 统一在构造时拼好，方便后续换前缀
-	semaphoreKey  string
-	queueKey      string
-	queueSeqKey   string
-	pubsubChannel string
+	semaphoreKey string
+	queueKey     string
+	queueSeqKey  string
+	natsSubject  string // NATS subject for slot-release notifications
 
 	stopOnce sync.Once     // 保证 Stop 幂等
 	stopCh   chan struct{} // 关闭时通知所有 Acquire 协程退出
@@ -72,11 +77,11 @@ type RateLimitConfig struct {
 	MaxConcurrent  int  `mapstructure:"max-concurrent"`   // 同时在跑的请求上限
 	MaxWaitSeconds int  `mapstructure:"max-wait-seconds"` // 排队最长等待；超时返回错误
 	LeaseSeconds   int  `mapstructure:"lease-seconds"`    // slot 的 TTL，防宿主宕机永不释放
-	PollIntervalMs int  `mapstructure:"poll-interval-ms"` // pubsub 兜底的轮询周期
+	PollIntervalMs int  `mapstructure:"poll-interval-ms"` // nats 通知兜底的轮询周期
 }
 
 // NewRateLimiter 填默认值后构造实例。默认组合：10 并发、30s 等待、30s 租约、200ms 轮询。
-func NewRateLimiter(rdb *redis.Client, cfg RateLimitConfig) *RateLimiter {
+func NewRateLimiter(rdb *redis.Client, natsPub *mq.NATSPublisher, cfg RateLimitConfig) *RateLimiter {
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 10
 	}
@@ -91,13 +96,14 @@ func NewRateLimiter(rdb *redis.Client, cfg RateLimitConfig) *RateLimiter {
 	}
 
 	return &RateLimiter{
-		rdb:           rdb,
-		cfg:           cfg,
-		semaphoreKey:  "ragent:ratelimit:semaphore",
-		queueKey:      "ragent:ratelimit:queue",
-		queueSeqKey:   "ragent:ratelimit:queue:seq",
-		pubsubChannel: "ragent:ratelimit:notify",
-		stopCh:        make(chan struct{}),
+		rdb:          rdb,
+		nats:         natsPub,
+		cfg:          cfg,
+		semaphoreKey: "ragent:ratelimit:semaphore",
+		queueKey:     "ragent:ratelimit:queue",
+		queueSeqKey:  "ragent:ratelimit:queue:seq",
+		natsSubject:  "ragent.ratelimit.notify",
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -136,13 +142,13 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// ---- 3) 订阅 release 通知，降低 polling 间隔 ----
+	// ---- 3) 订阅 NATS release 通知，降低 polling 间隔 ----
 	notifyCtx, notifyCancel := context.WithCancel(ctx)
 	defer notifyCancel()
-	notifyCh := l.startPubSub(notifyCtx)
+	notifyCh := l.startNATSNotify(notifyCtx)
 	defer notifyCh.close()
 
-	// ---- 4) 轮询 ticker：pubsub 漏消息时兜底；生产中常见网络抖动场景 ----
+	// ---- 4) 轮询 ticker：NATS 通知兜底；生产中常见网络抖动场景 ----
 	ticker := time.NewTicker(time.Duration(l.cfg.PollIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
@@ -165,7 +171,7 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 			continue
 		}
 
-		// 判我是不是“队头 avail 个”之一；不是就继续等下一轮
+		// 判我是不是"队头 avail 个"之一；不是就继续等下一轮
 		claimed, err := l.claimIfHead(ctx, requestID, avail)
 		if err != nil {
 			return "", err
@@ -190,7 +196,7 @@ func (l *RateLimiter) Acquire(ctx context.Context, userID string) (leaseID strin
 			return "", fmt.Errorf("queue re-add failed: %w", err)
 		}
 		// 发通知让其他等待者重新尝试（因为 slot 刚又变紧）
-		l.notifyAll(context.Background())
+		l.notifyAll()
 	}
 }
 
@@ -208,7 +214,7 @@ func (l *RateLimiter) availablePermits(ctx context.Context) int {
 }
 
 // claimIfHead 通过 Lua 原子地尝试把自己从队头 avail 个窗口里拿走（ZRem）。
-// 返回 true 表示“本请求获得出队资格”，但还需要继续抢 slot。
+// 返回 true 表示"本请求获得出队资格"，但还需要继续抢 slot。
 func (l *RateLimiter) claimIfHead(ctx context.Context, requestID string, avail int) (bool, error) {
 	res, err := l.rdb.Eval(ctx, claimQueueHeadLua, []string{l.queueKey}, requestID, avail).Result()
 	if err != nil {
@@ -238,7 +244,7 @@ func parseRedisLong(v interface{}) int64 {
 	}
 }
 
-// tryAcquire 用 Lua 原子 “SCARD 检查 + SADD” 抢一个 slot。
+// tryAcquire 用 Lua 原子 "SCARD 检查 + SADD" 抢一个 slot。
 // 成功返回 leaseID（lease:<unix-nano>），失败返回错误。
 // SET 本身带 EXPIRE（leaseSeconds）：宿主突然挂掉也不会让 slot 永占。
 func (l *RateLimiter) tryAcquire(ctx context.Context) (string, error) {
@@ -268,7 +274,7 @@ func (l *RateLimiter) tryAcquire(ctx context.Context) (string, error) {
 	return result.(string), nil
 }
 
-// Release 归还 slot 并 publish 通知下一个等待者。
+// Release 归还 slot 并通过 NATS publish 通知下一个等待者。
 // 用 Background ctx：即使业务 ctx 已 cancel，slot 也必须归还。
 func (l *RateLimiter) Release(ctx context.Context, leaseID string) {
 	if !l.cfg.Enabled || leaseID == "" {
@@ -276,57 +282,58 @@ func (l *RateLimiter) Release(ctx context.Context, leaseID string) {
 	}
 
 	l.rdb.SRem(ctx, l.semaphoreKey, leaseID)
-	l.notifyAll(ctx)
+	l.notifyAll()
 }
 
-// pubSubHandle 封装“通知 channel”+“关闭 channel”，上层 defer close 即可释放后台订阅协程。
-type pubSubHandle struct {
+// notifyHandle 封装"通知 channel"+"关闭 channel"，上层 defer close 即可释放后台订阅协程。
+type notifyHandle struct {
 	c    <-chan struct{} // 收到 release 事件时 tick 一下
 	done chan struct{}   // 主动关闭信号
 }
 
-func (h *pubSubHandle) close() {
+func (h *notifyHandle) close() {
 	close(h.done)
 }
 
-// startPubSub 订阅 pubsubChannel，把 Redis 消息转成 struct{} 送入 out。
+// startNATSNotify 订阅 NATS subject，把消息转成 struct{} 送入 out。
 // out 是带缓冲的 non-blocking（默认 16 容量，满了丢弃），Acquire 轮询侧本来就会 polling 兜底，
 // 丢消息不会导致饿死。
-func (l *RateLimiter) startPubSub(parent context.Context) *pubSubHandle {
+func (l *RateLimiter) startNATSNotify(parent context.Context) *notifyHandle {
 	done := make(chan struct{})
 	out := make(chan struct{}, 16)
 
+	if l.nats == nil {
+		// NATS 不可用时，返回空 handle，纯靠 polling ticker 兜底
+		return &notifyHandle{c: out, done: done}
+	}
+
+	sub, err := l.nats.Subscribe(l.natsSubject, func(data []byte) {
+		// non-blocking 发送：满了就丢
+		select {
+		case out <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		// 订阅失败，降级为纯轮询
+		return &notifyHandle{c: out, done: done}
+	}
+
 	go func() {
 		defer close(out)
-		sub := l.rdb.Subscribe(parent, l.pubsubChannel)
-		defer sub.Close()
-		ch := sub.Channel()
-		for {
-			select {
-			case <-done:
-				return
-			case <-parent.Done():
-				return
-			case msg, ok := <-ch:
-				if !ok {
-					return
-				}
-				_ = msg
-				// non-blocking 发送：满了就丢
-				select {
-				case out <- struct{}{}:
-				default:
-				}
-			}
-		}
+		defer sub.Unsubscribe()
+		<-done
 	}()
 
-	return &pubSubHandle{c: out, done: done}
+	return &notifyHandle{c: out, done: done}
 }
 
-// notifyAll 向 pubsub 广播“有 slot 释放了”；所有实例的等待协程都会被唤醒重试。
-func (l *RateLimiter) notifyAll(ctx context.Context) {
-	l.rdb.Publish(ctx, l.pubsubChannel, "available")
+// notifyAll 向 NATS 广播"有 slot 释放了"；所有实例的等待协程都会被唤醒重试。
+func (l *RateLimiter) notifyAll() {
+	if l.nats == nil {
+		return
+	}
+	_ = l.nats.PublishRaw(l.natsSubject, []byte("available"))
 }
 
 // Stop 由 main 在关停时调用，通知所有 Acquire 协程尽快退出。

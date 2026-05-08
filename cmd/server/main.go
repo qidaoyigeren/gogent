@@ -17,6 +17,7 @@ import (
 	"gogent/internal/memory"
 	"gogent/internal/middleware"
 	"gogent/internal/model"
+	"gogent/internal/mq"
 	"gogent/internal/orchestrator"
 	internalparser "gogent/internal/parser"
 	"gogent/internal/prompt"
@@ -73,6 +74,17 @@ func main() {
 	})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		slog.Warn("redis not available", "err", err)
+	}
+
+	// NATS
+	var natsPub *mq.NATSPublisher
+	if cfg.NATS.URL != "" {
+		natsPub, err = mq.NewNATSPublisher(context.Background(), mq.NATSConfig{URL: cfg.NATS.URL})
+		if err != nil {
+			slog.Warn("nats not available, pub/sub disabled", "err", err)
+		} else {
+			slog.Info("nats connected", "url", cfg.NATS.URL)
+		}
 	}
 
 	// PostgreSQL with advanced connection pool (pgxpool)
@@ -292,7 +304,7 @@ func main() {
 	// Rate limiter (distributed)
 	var rateLimiter *service.RateLimiter
 	if rdb != nil {
-		rateLimiter = service.NewRateLimiter(rdb, service.RateLimitConfig{
+		rateLimiter = service.NewRateLimiter(rdb, natsPub, service.RateLimitConfig{
 			Enabled:        cfg.RAG.RateLimit.Global.Enabled,
 			MaxConcurrent:  cfg.RAG.RateLimit.Global.MaxConcurrent,
 			MaxWaitSeconds: cfg.RAG.RateLimit.Global.MaxWaitSeconds,
@@ -302,8 +314,8 @@ func main() {
 	}
 
 	// Distributed task cancellation
-	if rdb != nil {
-		handler.GetTaskManager().EnableDistributedCancel(rdb, 30*time.Minute)
+	if rdb != nil || natsPub != nil {
+		handler.GetTaskManager().EnableDistributedCancel(rdb, natsPub, 30*time.Minute)
 	}
 
 	// 4. Database initialization (manual SQL migration - production best practice)
@@ -450,6 +462,12 @@ func main() {
 	slog.Info("shutting down server...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if natsPub != nil {
+		natsPub.Close()
+	}
+	if rateLimiter != nil {
+		rateLimiter.Stop()
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("server shutdown error", "err", err)
 	}

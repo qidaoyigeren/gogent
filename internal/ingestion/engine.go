@@ -14,7 +14,7 @@ type PipelineNode interface {
 	Process(ctx context.Context, doc *Document) error
 }
 
-// NodeExecutor 新版单节点抽象：与 Java 侧对齐，入参是共享的 IngestionContext + 本节点 NodeConfig。
+// NodeExecutor 新版单节点抽象：入参是共享的 IngestionContext + 本节点 NodeConfig。
 type NodeExecutor interface {
 	Name() string
 	Execute(ctx context.Context, ingestCtx *IngestionContext, config NodeConfig) NodeResult

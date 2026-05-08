@@ -85,7 +85,6 @@ func (r *Resolver) Resolve(ctx context.Context, subQuestions []string, roots []*
 }
 
 // collectClassifyCandidates 收集所有启用的叶子节点（用于 LLM 分类）
-// 对齐 Java DefaultIntentClassifier：收集整棵树的所有叶子，而不仅是根节点的直接子节点
 func collectClassifyCandidates(roots []*IntentNode) []*IntentNode {
 	// 收集所有根节点下的叶子节点
 	seen := make(map[string]bool)
@@ -116,7 +115,7 @@ type intentScoreRef struct {
 	score float64 // 分数
 }
 
-// capTotalIntents 限制总意图数量（对齐 Java IntentResolver#capTotalIntents）
+// capTotalIntents 限制总意图数量
 // 策略：
 // 1. 每个子问题保留最高分意图（保证每个子问题至少有 1 个结果）
 // 2. 剩余槽位按全局分数排序分配

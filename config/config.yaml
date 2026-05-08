@@ -18,6 +18,9 @@ redis:
   password: ""
   db: 0
 
+nats:
+  url: "nats://127.0.0.1:4222"
+
 milvus:
   uri: "http://localhost:19530"
 
